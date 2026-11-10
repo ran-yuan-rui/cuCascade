@@ -39,6 +39,10 @@ option(
   CUCASCADE_BUILD_IO
   "Build the cucascade-io library (datasource, uring/rest reactors, prefetching cache)"
   ON)
+option(
+  CUCASCADE_BUILD_S3_RDMA
+  "Build the optional S3-over-RDMA io component (cucascade_io_s3rdma; requires CUCASCADE_BUILD_IO)"
+  OFF)
 
 option(
   CUCASCADE_BUILD_S3_BENCHMARK
@@ -135,6 +139,19 @@ if(CUCASCADE_BUILD_IO AND CUCASCADE_TOPOLOGY_ONLY)
   set(CUCASCADE_BUILD_IO
       OFF
       CACHE BOOL "Build the cucascade-io library" FORCE)
+endif()
+
+# The S3-over-RDMA component extends the io library. Checked after the io gating
+# above so a force-disabled io also disables it.
+if(CUCASCADE_BUILD_S3_RDMA AND NOT CUCASCADE_BUILD_IO)
+  message(
+    STATUS "CUCASCADE_BUILD_S3_RDMA disabled: requires CUCASCADE_BUILD_IO=ON")
+  set(CUCASCADE_BUILD_S3_RDMA
+      OFF
+      CACHE BOOL "Build the S3-over-RDMA io component" FORCE)
+  # A parent project may have set the option as a normal variable, which the
+  # cache write above does not replace.
+  set(CUCASCADE_BUILD_S3_RDMA OFF)
 endif()
 
 # The S3 benchmark needs the io library (rest backend) and the benchmark tree.
@@ -371,6 +388,17 @@ if(CUCASCADE_BUILD_IO)
             ${CUCASCADE_CUDA_WARNING_FLAGS})
 endif()
 
+if(CUCASCADE_BUILD_S3_RDMA)
+  # The S3-over-RDMA component has its own object library: its sources never
+  # join cucascade_io_objects.
+  add_library(cucascade_io_s3rdma_objects OBJECT)
+
+  target_compile_options(
+    cucascade_io_s3rdma_objects
+    PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS}>
+            ${CUCASCADE_CUDA_WARNING_FLAGS})
+endif()
+
 target_compile_options(
   cucascade_topology_discovery_objects
   PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${CUCASCADE_CXX_WARNING_FLAGS}>
@@ -471,6 +499,19 @@ if(CUCASCADE_BUILD_IO)
   set_target_properties(
     cucascade_io_objects PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE
                                                        ON)
+endif()
+
+if(CUCASCADE_BUILD_S3_RDMA)
+  # The component inherits the io usage requirements by linking the io object
+  # library; it adds no dependency of its own.
+  target_link_libraries(cucascade_io_s3rdma_objects PUBLIC cucascade_io_objects)
+  target_include_directories(cucascade_io_s3rdma_objects
+                             PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+  target_compile_features(cucascade_io_s3rdma_objects PUBLIC cxx_std_20)
+
+  set_target_properties(
+    cucascade_io_s3rdma_objects PROPERTIES CXX_EXTENSIONS OFF
+                                           POSITION_INDEPENDENT_CODE ON)
 endif()
 
 target_include_directories(cucascade_topology_discovery_objects
@@ -577,6 +618,27 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
         cucascade_io_static PROPERTIES OUTPUT_NAME cucascade_io
                                        EXPORT_NAME cucascade_io_static)
     endif()
+
+    if(CUCASCADE_BUILD_S3_RDMA)
+      add_library(cucascade_io_s3rdma_static STATIC
+                  $<TARGET_OBJECTS:cucascade_io_s3rdma_objects>)
+      add_library(cuCascade::cucascade_io_s3rdma_static ALIAS
+                  cucascade_io_s3rdma_static)
+
+      target_include_directories(cucascade_io_s3rdma_static
+                                 PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+      target_link_libraries(cucascade_io_s3rdma_static
+                            PUBLIC cucascade_io_static)
+      target_compile_features(cucascade_io_s3rdma_static PUBLIC cxx_std_20)
+      # Lets a consumer guard its use of the component.
+      target_compile_definitions(cucascade_io_s3rdma_static
+                                 INTERFACE CUCASCADE_HAS_S3_RDMA)
+
+      set_target_properties(
+        cucascade_io_s3rdma_static
+        PROPERTIES OUTPUT_NAME cucascade_io_s3rdma EXPORT_NAME
+                                                   cucascade_io_s3rdma_static)
+    endif()
   endif()
 endif()
 
@@ -657,6 +719,25 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
       set_target_properties(cucascade_io_shared PROPERTIES OUTPUT_NAME
                                                            cucascade_io)
     endif()
+
+    if(CUCASCADE_BUILD_S3_RDMA)
+      add_library(cucascade_io_s3rdma_shared SHARED
+                  $<TARGET_OBJECTS:cucascade_io_s3rdma_objects>)
+      add_library(cuCascade::cucascade_io_s3rdma_shared ALIAS
+                  cucascade_io_s3rdma_shared)
+
+      target_include_directories(cucascade_io_s3rdma_shared
+                                 PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
+      target_link_libraries(cucascade_io_s3rdma_shared
+                            PUBLIC cucascade_io_shared)
+      target_compile_features(cucascade_io_s3rdma_shared PUBLIC cxx_std_20)
+      # Lets a consumer guard its use of the component.
+      target_compile_definitions(cucascade_io_s3rdma_shared
+                                 INTERFACE CUCASCADE_HAS_S3_RDMA)
+
+      set_target_properties(cucascade_io_s3rdma_shared
+                            PROPERTIES OUTPUT_NAME cucascade_io_s3rdma)
+    endif()
   endif()
 endif()
 
@@ -676,6 +757,11 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
       add_library(cuCascade::cucascade_io ALIAS cucascade_io_shared)
       add_library(cucascade_io ALIAS cucascade_io_shared)
     endif()
+    if(CUCASCADE_BUILD_S3_RDMA)
+      add_library(cuCascade::cucascade_io_s3rdma ALIAS
+                  cucascade_io_s3rdma_shared)
+      add_library(cucascade_io_s3rdma ALIAS cucascade_io_s3rdma_shared)
+    endif()
   endif()
   add_library(cuCascade::cucascade_topology_discovery ALIAS
               cucascade_topology_discovery_shared)
@@ -692,6 +778,11 @@ elseif(CUCASCADE_BUILD_STATIC_LIBS)
     if(CUCASCADE_BUILD_IO)
       add_library(cuCascade::cucascade_io ALIAS cucascade_io_static)
       add_library(cucascade_io ALIAS cucascade_io_static)
+    endif()
+    if(CUCASCADE_BUILD_S3_RDMA)
+      add_library(cuCascade::cucascade_io_s3rdma ALIAS
+                  cucascade_io_s3rdma_static)
+      add_library(cucascade_io_s3rdma ALIAS cucascade_io_s3rdma_static)
     endif()
   endif()
   add_library(cuCascade::cucascade_topology_discovery ALIAS
@@ -747,6 +838,9 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
     if(CUCASCADE_BUILD_IO)
       list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_io_static)
     endif()
+    if(CUCASCADE_BUILD_S3_RDMA)
+      list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_io_s3rdma_static)
+    endif()
   endif()
 endif()
 if(CUCASCADE_BUILD_SHARED_LIBS)
@@ -758,6 +852,9 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
     endif()
     if(CUCASCADE_BUILD_IO)
       list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_io_shared)
+    endif()
+    if(CUCASCADE_BUILD_S3_RDMA)
+      list(APPEND CUCASCADE_INSTALL_TARGETS cucascade_io_s3rdma_shared)
     endif()
   endif()
 endif()

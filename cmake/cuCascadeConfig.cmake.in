@@ -31,13 +31,25 @@ endif()
 # are reconstructed here with the same pkg_check_modules calls used at build
 # time. The cudf component also needs these when io was built: cucascade_cudf
 # links cucascade_io for the cudf::io::datasource bridge.
+#
+# The optional S3-over-RDMA io component is the `s3rdma` package component. Its
+# targets link cucascade_io, so requesting it resolves the same dependencies.
+# cuCascade_s3rdma_FOUND reflects whether the component is available in this
+# install.
+set(cuCascade_s3rdma_FOUND @CUCASCADE_BUILD_S3_RDMA@)
 set(cuCascade_io_FOUND @CUCASCADE_BUILD_IO@)
 if(cuCascade_io_FOUND AND ("io" IN_LIST cuCascade_FIND_COMPONENTS
-                           OR "cudf" IN_LIST cuCascade_FIND_COMPONENTS))
+                           OR "cudf" IN_LIST cuCascade_FIND_COMPONENTS
+                           OR "s3rdma" IN_LIST cuCascade_FIND_COMPONENTS))
   find_dependency(PkgConfig REQUIRED)
   pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
   pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
   find_dependency(OpenSSL REQUIRED)
+  # The io library links kvikIO when it was built alongside the cudf layer; the
+  # exported io targets reference kvikio::kvikio by name.
+  if(cuCascade_cudf_FOUND)
+    find_dependency(kvikio REQUIRED CONFIG)
+  endif()
 
   # Best-effort check that the moodycamel headers the installed io headers
   # include are reachable. They are not shipped (the consumer provides the same
@@ -72,7 +84,8 @@ set(cuCascade_USE_ABSEIL_INVOCABLE @CUCASCADE_USE_ABSEIL_INVOCABLE@)
 if(cuCascade_io_FOUND
    AND cuCascade_USE_ABSEIL_INVOCABLE
    AND ("io" IN_LIST cuCascade_FIND_COMPONENTS
-        OR "cudf" IN_LIST cuCascade_FIND_COMPONENTS))
+        OR "cudf" IN_LIST cuCascade_FIND_COMPONENTS
+        OR "s3rdma" IN_LIST cuCascade_FIND_COMPONENTS))
   find_dependency(absl REQUIRED CONFIG)
 endif()
 
@@ -113,6 +126,19 @@ if(TARGET cuCascade::cucascade_io_shared)
 elseif(TARGET cuCascade::cucascade_io_static)
   if(NOT TARGET cuCascade::cucascade_io)
     add_library(cuCascade::cucascade_io ALIAS cuCascade::cucascade_io_static)
+  endif()
+endif()
+# Default alias for the S3-over-RDMA io component (only present when
+# CUCASCADE_BUILD_S3_RDMA was ON)
+if(TARGET cuCascade::cucascade_io_s3rdma_shared)
+  if(NOT TARGET cuCascade::cucascade_io_s3rdma)
+    add_library(cuCascade::cucascade_io_s3rdma ALIAS
+                cuCascade::cucascade_io_s3rdma_shared)
+  endif()
+elseif(TARGET cuCascade::cucascade_io_s3rdma_static)
+  if(NOT TARGET cuCascade::cucascade_io_s3rdma)
+    add_library(cuCascade::cucascade_io_s3rdma ALIAS
+                cuCascade::cucascade_io_s3rdma_static)
   endif()
 endif()
 # Users can link to cuCascade::cucascade_topology_discovery,

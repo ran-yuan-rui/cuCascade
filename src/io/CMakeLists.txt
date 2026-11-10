@@ -45,3 +45,9 @@ if(CUCASCADE_BUILD_CUDF)
   target_sources(cucascade_io_objects
                  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/kvikio/kvikio_context.cpp)
 endif()
+
+# The optional S3-over-RDMA component adds its sources to its own object
+# library.
+if(CUCASCADE_BUILD_S3_RDMA)
+  add_subdirectory(s3rdma)
+endif()
