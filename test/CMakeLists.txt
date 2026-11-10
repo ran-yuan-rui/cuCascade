@@ -146,6 +146,29 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
   add_test(NAME cucascade_io_tests COMMAND cucascade_io_tests)
 endif()
 
+if(CUCASCADE_BUILD_S3_RDMA)
+  # S3-over-RDMA component test executable. It uses Catch2's own main instead of
+  # unittest.cpp: no GPU pool is created and no device is touched.
+  add_executable(
+    cucascade_s3rdma_tests
+    io/s3rdma/mock_rdma_client.cpp
+    io/s3rdma/test_admission_gate.cpp
+    io/s3rdma/test_mock_rdma_client.cpp
+    # Replaces the global operator new for the whole test binary
+    utils/allocation_counter.cpp)
+
+  target_include_directories(
+    cucascade_s3rdma_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+                                   ${CMAKE_CURRENT_SOURCE_DIR}/utils)
+
+  target_link_libraries(cucascade_s3rdma_tests PRIVATE cucascade_io_s3rdma
+                                                       Catch2::Catch2WithMain)
+
+  add_test(NAME cucascade_s3rdma_tests COMMAND cucascade_s3rdma_tests --order
+                                               decl)
+  set_tests_properties(cucascade_s3rdma_tests PROPERTIES TIMEOUT 180)
+endif()
+
 if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
   # cudf-coupled test executable - links the cucascade-cudf library.
   add_executable(

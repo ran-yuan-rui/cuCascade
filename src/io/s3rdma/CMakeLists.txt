@@ -17,5 +17,7 @@
 
 # Sources of the optional S3-over-RDMA component (CUCASCADE_BUILD_S3_RDMA).
 target_sources(
-  cucascade_io_s3rdma_objects PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/config.cpp
-                                      ${CMAKE_CURRENT_SOURCE_DIR}/errors.cpp)
+  cucascade_io_s3rdma_objects
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/admission_gate.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/config.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/errors.cpp)
