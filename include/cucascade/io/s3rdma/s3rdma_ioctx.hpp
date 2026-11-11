@@ -59,7 +59,7 @@ class s3rdma_ioctx final : public templated_ioctx<s3rdma_reactor> {
   [[nodiscard]] io_context_type type() const noexcept override;
 
   /**
-   * @brief Entry of every asynchronous read.
+   * @brief Backend entry for prepared asynchronous reads.
    *
    * Empty input yields a ready 0.  Otherwise the completion callback of each
    * slice runs once with @c false and the returned future carries
