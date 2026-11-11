@@ -154,6 +154,7 @@ if(CUCASCADE_BUILD_S3_RDMA)
     io/s3rdma/mock_rdma_client.cpp
     io/s3rdma/test_admission_gate.cpp
     io/s3rdma/test_mock_rdma_client.cpp
+    io/s3rdma/test_s3rdma_ioctx_skeleton.cpp
     # Replaces the global operator new for the whole test binary
     utils/allocation_counter.cpp)
 

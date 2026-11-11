@@ -61,12 +61,18 @@ struct rx_chunk {
  * remainder, and every claimed chunk settles its own.
  *
  * Terminal state.  After @ref begin_close or @ref fail_stop every admission
- * call reports the first fatal error when one was latched, otherwise one
- * stable "closed" error.  A fatal may be latched after closing and then
- * replaces the closed error for good.
+ * call made with valid input reports the first fatal error when one was
+ * latched, otherwise one stable "closed" error.  A fatal may be latched after
+ * closing and then replaces the closed error for good.  A request outside the
+ * accepted input is refused as such whether or not the gate is terminal.
  *
- * The queue storage is allocated in the constructor; intake, claims,
- * admissions and transitions do not allocate.
+ * Allocation.  The queue storage is allocated in the constructor.  After that
+ * the gate's own bookkeeping does not allocate in intake, claim and admission
+ * when they succeed, nor in the transitions.  Completion callbacks, the arena
+ * marker and the exception of a refusal are outside that statement.
+ *
+ * Lifetime.  The gate must outlive every chunk, permit, scope and batch it
+ * handed out and every call into it; it joins nobody.
  */
 class admission_gate {
   /// Fixed-capacity FIFO of queued requests; moves in O(1).
@@ -108,8 +114,9 @@ class admission_gate {
    *
    * A slice's completion callback travels with the chunk that takes its last
    * piece and runs once when that chunk settles.  It reports success when that
-   * chunk completed and the request had not failed by then; the request's
-   * future stays the authority on the outcome.
+   * chunk completed and the request had not failed by then.  It does not mean
+   * the whole slice was delivered — earlier chunks of the slice may still be
+   * in flight — so only the request's future decides the outcome.
    */
   class claimed_chunk {
    public:
@@ -203,9 +210,11 @@ class admission_gate {
   /**
    * @brief The requests detached by one terminal transition.
    *
-   * The receiver fails them with @ref error_complete_all and returns the token
-   * through @ref admission_gate::complete_drain.  A transition that found
-   * nothing to detach returns an empty batch without a token.
+   * The receiver owes, in this order: @ref error_complete_all, then
+   * @ref take_token, then @ref admission_gate::complete_drain on the gate the
+   * batch came from.  Close does not complete until that token is returned.
+   * The obligation moves with the batch.  A transition that found nothing to
+   * detach returns an empty batch without a token.
    */
   class drain_batch {
    public:
@@ -214,7 +223,8 @@ class admission_gate {
     drain_batch& operator=(drain_batch&&) noexcept;
     drain_batch(drain_batch const&)            = delete;
     drain_batch& operator=(drain_batch const&) = delete;
-    /// Requests still in the batch are failed with the gate's terminal error.
+    /// Requests still in the batch are failed with the terminal error of the
+    /// transition that detached them.  This does not return the token.
     ~drain_batch();
 
     [[nodiscard]] bool empty() const noexcept { return _ring.empty(); }
@@ -245,7 +255,9 @@ class admission_gate {
   admission_gate(std::size_t queue_cap, std::size_t slot_bytes);
   admission_gate(admission_gate const&)            = delete;
   admission_gate& operator=(admission_gate const&) = delete;
-  /// Requests still queued are failed with the closed error.
+  /// Requests still queued are failed with the closed error.  Precondition: no
+  /// other thread is using the gate and none of its chunks, permits or scopes
+  /// is alive.
   ~admission_gate();
 
   /// Called once, under the gate mutex, by the transition that latches the
@@ -258,9 +270,9 @@ class admission_gate {
    *
    * @return Null on success; ownership moved into the gate.  Otherwise the
    *         error, with @p request untouched and still the caller's to
-   *         settle: the terminal error once the gate is terminal (also for a
-   *         submitter woken by the transition), @c errc::internal_error for
-   *         a request outside the accepted input.
+   *         settle: @c errc::internal_error for a request outside the
+   *         accepted input, checked first; else the terminal error once the
+   *         gate is terminal (also for a submitter woken by the transition).
    */
   [[nodiscard]] std::exception_ptr submit(std::unique_ptr<grouped_io_request>& request) noexcept;
 
@@ -272,10 +284,13 @@ class admission_gate {
   /**
    * @brief Permission to start the GET of @p chunk; marks it admitted.
    *
-   * @throws The terminal error once the gate is terminal;
-   *         @c errc::request_canceled when the chunk's request has already
-   *         failed.  On a throw the chunk stays claimed, unadmitted and
-   *         unsettled.
+   * @p chunk must be a live chunk of this gate that is neither settled nor
+   * admitted yet.
+   *
+   * @throws The terminal error once the gate is terminal; else
+   *         @c errc::internal_error for a chunk outside that precondition;
+   *         else @c errc::request_canceled when the chunk's request has
+   *         already failed.  A throw leaves @p chunk exactly as it was.
    */
   void acquire_get(claimed_chunk& chunk);
 
@@ -291,10 +306,13 @@ class admission_gate {
   /// Close without waiting; a holder of a permit or a chunk may call it.
   [[nodiscard]] drain_batch begin_close() noexcept;
 
+  /// Acknowledge a drained batch.  @p token comes from a batch of this gate,
+  /// taken after the batch's requests were failed.
   void complete_drain(drain_token&& token) noexcept;
 
   /// Blocks until the gate is terminal, no control permit and no claimed chunk
-  /// is alive, and a detached queue was drained.
+  /// is alive, and a detached queue was drained.  It does not wait for threads
+  /// that are inside or about to enter another member function.
   void await_closed();
 
   [[nodiscard]] bool terminal() const noexcept;
