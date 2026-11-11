@@ -37,11 +37,13 @@ namespace cucascade::io::s3rdma {
 /**
  * @brief I/O context of the S3-over-RDMA backend: one reactor, device reads only.
  *
- * The data path is not implemented yet.  Every read entry fails
- * deterministically, without calling a transport client, touching a device or
- * looking at the object's size.  Object open fails with
- * @c errc::backend_unavailable, so no object of this backend exists whose size
- * was not read from the store.
+ * The data path is not implemented yet.  The mixed read entry returns ready
+ * zero for empty input and otherwise fails after invoking each supplied
+ * completion callback with false.  That entry does not inspect the object,
+ * call a transport client or touch a device.  Inherited read wrappers retain
+ * their zero-size and argument checks; synchronous host reads also clip to
+ * the caller-established object size.  All object-open variants are
+ * unavailable.
  */
 class s3rdma_ioctx final : public templated_ioctx<s3rdma_reactor> {
  public:

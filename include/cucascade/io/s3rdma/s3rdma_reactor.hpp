@@ -118,8 +118,8 @@ class s3rdma_reactor {
   void shutdown() noexcept {}
   void interrupt() noexcept {}
 
-  /// @throws error with @c errc::backend_unavailable.  No object is opened, so
-  ///         none carries a size that was not read from the store.
+  /// @throws error with @c errc::backend_unavailable: object open is not
+  ///         implemented yet.
   static std::unique_ptr<io_object_type> create_io_object(std::string path);
 
   /// True for `s3://` paths.
