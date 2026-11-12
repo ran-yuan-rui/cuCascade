@@ -8,8 +8,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 namespace cucascade::test::s3rdma {
@@ -42,6 +44,8 @@ class mock_rdma_client final : public io::s3rdma::s3_control_client,
   ~mock_rdma_client() override;
   void put(io::s3rdma::object_ref const& object, std::vector<std::uint8_t> bytes);
   void script(get_behavior behavior, std::optional<std::int64_t> sdk_return = {});
+  void script_deregister(bool released);
+  void writer(std::function<void(std::uint8_t*, std::uint8_t const*, std::size_t)> copy);
   void callback_limit(std::optional<std::int64_t> bytes);
   [[nodiscard]] mock_counts counts() const;
 
@@ -60,7 +64,9 @@ class mock_rdma_client final : public io::s3rdma::s3_control_client,
 
 inline io::s3rdma::transport_clients clients(std::shared_ptr<mock_rdma_client> const& mock)
 {
-  return {mock, mock};
+  return {mock, mock, {{206}, +[](std::string_view tag, long status) noexcept {
+                         return status == 206 && tag == "mock-rdma";
+                       }}};
 }
 
 }  // namespace cucascade::test::s3rdma

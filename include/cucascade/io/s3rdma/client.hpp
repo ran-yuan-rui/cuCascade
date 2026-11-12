@@ -24,6 +24,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace cucascade::io::s3rdma {
 
@@ -115,6 +117,10 @@ enum class data_commit_state : std::uint8_t {
  *
  * The caller decides from all fields together whether the GET delivered.  No
  * single field is sufficient on its own, @c sdk_return included.
+ *
+ * @c sdk_return carries the SDK's value unchanged.  The backend reads it as a
+ * byte count: a GET delivered only when it equals the requested size and
+ * every other field agrees.
  */
 struct data_get_result {
   data_commit_state commit{data_commit_state::not_sent};
@@ -148,8 +154,15 @@ class rdma_data_session {
    */
   virtual void register_memory(std::uint8_t* base, std::size_t bytes) = 0;
 
-  /// Undo @ref register_memory for the range that starts at @p base.
-  virtual void deregister_memory(std::uint8_t* base) noexcept = 0;
+  /**
+   * @brief Undo @ref register_memory for the range that starts at @p base.
+   *
+   * @return True when the registration is known to be gone: every resource
+   *         the session held for it was returned and the registration itself
+   *         was released.  False when any step failed or its outcome is
+   *         unknown; the caller then keeps the memory and this session alive.
+   */
+  [[nodiscard]] virtual bool deregister_memory(std::uint8_t* base) noexcept = 0;
 
   /// Largest GET the registration at @p registered_base can receive in one
   /// request, in bytes; negative when unknown.
@@ -190,10 +203,27 @@ class rdma_data_session_factory {
   [[nodiscard]] virtual std::unique_ptr<rdma_data_session> acquire() = 0;
 };
 
-/// The clients the backend is built from.  Both are required.
+/**
+ * @brief The response a data-plane GET must carry to count as delivered.
+ *
+ * Both members are required.  The rule only adds conditions: a GET that fails
+ * any other check of the backend is not delivered whatever the rule says.
+ */
+struct completion_rule {
+  /// HTTP statuses of a delivered GET.
+  std::vector<long> accepted_statuses;
+
+  /// True when @p reply_tag is the reply of a delivered GET with status
+  /// @p http_status.
+  bool (*reply_ok)(std::string_view reply_tag, long http_status) noexcept {nullptr};
+};
+
+/// What the backend is built from.  Both clients and a complete rule are
+/// required.
 struct transport_clients {
   std::shared_ptr<s3_control_client> control;
   std::shared_ptr<rdma_data_session_factory> data_sessions;
+  completion_rule rule;
 };
 
 }  // namespace cucascade::io::s3rdma

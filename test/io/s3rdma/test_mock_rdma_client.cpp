@@ -25,7 +25,7 @@ struct fixture {
     mock->put(ref, source);
     session->register_memory(destination.data() + 4, 16);
   }
-  ~fixture() { session->deregister_memory(destination.data() + 4); }
+  ~fixture() { (void)session->deregister_memory(destination.data() + 4); }
   rdma::data_get_result get(std::size_t size = 4, std::size_t landing = 3)
   {
     return session->get(ref, 1, size, destination.data() + 4, landing);
@@ -43,7 +43,7 @@ TEST_CASE("S3RDMA mock registrations serve distinct sessions", "[s3rdma][mock]")
   auto result = worker->get(f.ref, 0, 2, f.destination.data() + 4, 0);
   CHECK(result.delivered_bytes == 2);
   CHECK(f.destination[4] == 2);
-  f.session->deregister_memory(f.destination.data() + 4);
+  (void)f.session->deregister_memory(f.destination.data() + 4);
   auto const before = f.destination;
   require_code([&] { (void)worker->get(f.ref, 0, 2, f.destination.data() + 4, 0); },
                rdma::errc::unsupported_request);
@@ -70,6 +70,21 @@ TEST_CASE("S3RDMA mock domain refusals never write", "[s3rdma][mock]")
                rdma::errc::unsupported_request);
   CHECK(f.destination == before);
   CHECK(f.mock->counts().issued_requests == 0);
+}
+
+TEST_CASE("S3RDMA mock failed release keeps the registration live", "[s3rdma][mock]")
+{
+  fixture f;
+  auto* base = f.destination.data() + 4;
+  f.mock->script_deregister(false);
+  CHECK_FALSE(f.session->deregister_memory(base));
+  CHECK(f.session->max_request_callback_size(base) == 16);
+  CHECK(f.mock->counts().deregistrations == 0);
+  CHECK(f.get().delivered_bytes == 4);
+  f.mock->script_deregister(true);
+  CHECK(f.session->deregister_memory(base));
+  CHECK(f.session->max_request_callback_size(base) < 0);
+  CHECK(f.mock->counts().deregistrations == 1);
 }
 
 TEST_CASE("S3RDMA mock capacity lookup uses each registration base", "[s3rdma][mock]")

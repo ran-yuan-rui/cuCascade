@@ -27,6 +27,8 @@ struct mock_rdma_client::state {
   std::map<std::pair<std::string, std::string>, std::vector<std::uint8_t>> objects;
   std::map<std::uint8_t*, std::size_t> registrations;
   std::deque<step> steps;
+  std::deque<bool> releases;
+  std::function<void(std::uint8_t*, std::uint8_t const*, std::size_t)> copy;
   std::optional<std::int64_t> callback_limit;
   mock_counts counts;
 };
@@ -48,10 +50,16 @@ class mock_rdma_client::session final : public rdma::rdma_data_session {
     ++_state->counts.registrations;
   }
 
-  void deregister_memory(std::uint8_t* base) noexcept override
+  bool deregister_memory(std::uint8_t* base) noexcept override
   {
     std::lock_guard lock(_state->mutex);
+    if (!_state->releases.empty()) {
+      auto const released = _state->releases.front();
+      _state->releases.pop_front();
+      if (!released) { return false; }
+    }
     _state->counts.deregistrations += _state->registrations.erase(base);
+    return true;
   }
 
   std::int64_t max_request_callback_size(std::uint8_t* base) noexcept override
@@ -102,7 +110,11 @@ class mock_rdma_client::session final : public rdma::rdma_data_session {
       return result;
     }
     auto const written = step.behavior == get_behavior::completed_short ? size - 1 : size;
-    std::memcpy(base + landing, bytes.data() + offset, written);
+    if (_state->copy) {
+      _state->copy(base + landing, bytes.data() + offset, written);
+    } else {
+      std::memcpy(base + landing, bytes.data() + offset, written);
+    }
     result.delivered_bytes = written;
     result.http_status     = 206;
     result.reply_tag       = "mock-rdma";
@@ -140,6 +152,19 @@ void mock_rdma_client::callback_limit(std::optional<std::int64_t> bytes)
 {
   std::lock_guard lock(_state->mutex);
   _state->callback_limit = bytes;
+}
+
+void mock_rdma_client::script_deregister(bool released)
+{
+  std::lock_guard lock(_state->mutex);
+  _state->releases.push_back(released);
+}
+
+void mock_rdma_client::writer(
+  std::function<void(std::uint8_t*, std::uint8_t const*, std::size_t)> copy)
+{
+  std::lock_guard lock(_state->mutex);
+  _state->copy = std::move(copy);
 }
 
 mock_counts mock_rdma_client::counts() const
