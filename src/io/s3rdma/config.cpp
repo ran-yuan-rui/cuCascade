@@ -18,6 +18,7 @@
 
 #include <cucascade/io/s3rdma/config.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <limits>
 #include <stdexcept>
@@ -35,6 +36,13 @@ config sanitized(config cfg)
   if (cfg.queue_cap.has_value() && *cfg.queue_cap == 0) {
     throw std::invalid_argument("s3rdma: queue_cap must be positive when set");
   }
+  if (cfg.devices.empty()) { throw std::invalid_argument("s3rdma: devices must not be empty"); }
+  auto sorted = cfg.devices;
+  std::sort(sorted.begin(), sorted.end());
+  if (sorted.front() < 0) { throw std::invalid_argument("s3rdma: a device id is negative"); }
+  if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) {
+    throw std::invalid_argument("s3rdma: a device id is listed twice");
+  }
 
   constexpr auto max_size = std::numeric_limits<std::size_t>::max();
   if (cfg.max_inflight > max_size / cfg.arena_slot_size) {
@@ -47,6 +55,15 @@ config sanitized(config cfg)
     cfg.queue_cap = 4 * cfg.max_inflight;
   }
   return cfg;
+}
+
+std::size_t arena_bytes(config const& cfg)
+{
+  if (cfg.arena_slot_size != 0 &&
+      cfg.max_inflight > std::numeric_limits<std::size_t>::max() / cfg.arena_slot_size) {
+    throw std::invalid_argument("s3rdma: max_inflight x arena_slot_size overflows");
+  }
+  return cfg.max_inflight * cfg.arena_slot_size;
 }
 
 }  // namespace cucascade::io::s3rdma

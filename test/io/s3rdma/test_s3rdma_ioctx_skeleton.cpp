@@ -11,6 +11,7 @@
 #include "utils/allocation_counter.hpp"
 
 #include <cucascade/io/datasource_factory.hpp>
+#include <cucascade/io/s3rdma/cuda_delivery.hpp>
 #include <cucascade/io/s3rdma/s3rdma_ioctx.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/null_device_memory_resource.hpp>
@@ -30,6 +31,7 @@ rdma::config geometry()
   cfg.max_inflight           = 2;
   cfg.arena_slot_size        = 4;
   cfg.n_max_concurrent_scans = 5;
+  cfg.devices                = {7};
   return cfg;
 }
 
@@ -194,7 +196,7 @@ TEST_CASE("S3RDMA mixed entry refuses every host destination shape exactly once"
   no_transport(*mock);
 }
 
-TEST_CASE("S3RDMA device entry fails unavailable without metadata or CUDA probes",
+TEST_CASE("S3RDMA device entry before start refuses without metadata or CUDA probes",
           "[s3rdma][ioctx]")
 {
   deadline bound;
@@ -212,8 +214,7 @@ TEST_CASE("S3RDMA device entry fails unavailable without metadata or CUDA probes
   no_transport(*mock);
 }
 
-TEST_CASE("S3RDMA every open form reports unavailable instead of inventing a size",
-          "[s3rdma][ioctx]")
+TEST_CASE("S3RDMA every open form before start refuses without inventing a size", "[s3rdma][ioctx]")
 {
   deadline bound;
   auto mock = std::make_shared<mock_rdma_client>();
@@ -228,7 +229,8 @@ TEST_CASE("S3RDMA every open form reports unavailable instead of inventing a siz
   no_transport(*mock);
 }
 
-TEST_CASE("S3RDMA direct reactor stub settles every known-size request slice", "[s3rdma][ioctx]")
+TEST_CASE("S3RDMA direct reactor before start settles every known-size request slice",
+          "[s3rdma][ioctx]")
 {
   deadline bound;
   auto mock    = std::make_shared<mock_rdma_client>();
@@ -246,7 +248,6 @@ TEST_CASE("S3RDMA direct reactor stub settles every known-size request slice", "
   auto request     = io::grouped_io_request::create(object, std::move(slices));
   auto coordinator = request->coordinator;
   auto future      = coordinator->get_future();
-  reactor.start();
   reactor.enqueue(std::move(request));
   CHECK(coordinator->tasks_remaining() == 0);
   require_code([&] { (void)std::move(future).get(2s); }, rdma::errc::backend_unavailable);
@@ -258,7 +259,7 @@ TEST_CASE("S3RDMA direct reactor stub settles every known-size request slice", "
   no_transport(*mock);
 }
 
-TEST_CASE("S3RDMA reactor host read is unavailable and inherited async host entry is refused",
+TEST_CASE("S3RDMA synchronous and asynchronous host reads before start are refused",
           "[s3rdma][ioctx]")
 {
   deadline bound;
@@ -271,8 +272,9 @@ TEST_CASE("S3RDMA reactor host read is unavailable and inherited async host entr
   require_code([&] { (void)reactor.host_read(*object, 0, 4, destination.data()); },
                rdma::errc::backend_unavailable);
   rdma::s3rdma_ioctx ctx{geometry(), clients(mock)};
-  auto future = ctx.host_read_async_io(*object, 0, 4, destination.data());
-  require_code([&] { (void)std::move(future).get(2s); }, rdma::errc::unsupported_request);
+  auto future =
+    ctx.host_read_async_io(*object, 0, 4, destination.data(), io::io_priority::automatic);
+  require_code([&] { (void)std::move(future).get(2s); }, rdma::errc::backend_unavailable);
   no_transport(*mock);
 }
 
@@ -298,13 +300,14 @@ TEST_CASE("S3RDMA registry replacement routes S3 and constructs the injected con
 TEST_CASE("S3RDMA registry factories contain invalid input and allocation failures",
           "[s3rdma][ioctx]")
 {
-  auto const fault = GENERATE(0, 1, 2, 3, 4, 5, 6);
+  auto const fault = GENERATE(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13);
   deadline bound;
   cpu_memory fixture;
   io::io_context_registry registry{io::io_config{}, fixture.manager};
   auto mock      = std::make_shared<mock_rdma_client>();
   auto cfg       = geometry();
   auto transport = clients(mock);
+  auto ops       = rdma::default_delivery_ops();
   if (fault == 0) { transport.control.reset(); }
   if (fault == 1) { transport.data_sessions.reset(); }
   if (fault == 2) { cfg.max_inflight = 0; }
@@ -315,10 +318,17 @@ TEST_CASE("S3RDMA registry factories contain invalid input and allocation failur
     cfg.arena_slot_size = 1;
     cfg.queue_cap       = std::numeric_limits<std::size_t>::max();
   }
+  if (fault == 7) { cfg.devices.clear(); }
+  if (fault == 8) { cfg.devices = {-1}; }
+  if (fault == 9) { cfg.devices = {7, 7}; }
+  if (fault == 10) { transport.rule.accepted_statuses.clear(); }
+  if (fault == 11) { transport.rule.reply_ok = nullptr; }
+  if (fault == 12) { ops = {}; }
+  if (fault == 13) { ops.event_synchronize = {}; }
   registry.replace_ioctx(io::io_context_type::restful,
                          io::io_context_type::s3rdma,
                          &rdma::supports,
-                         rdma::make_ioctx_factory(cfg, transport));
+                         rdma::make_ioctx_factory(cfg, transport, ops));
   std::shared_ptr<io::ioctx> result;
   if (fault == 6) {
     std::size_t allocations = 0;
@@ -334,4 +344,5 @@ TEST_CASE("S3RDMA registry factories contain invalid input and allocation failur
   }
   CHECK(result == nullptr);
   CHECK(registry.make_ioctx(io::io_context_type::restful) == nullptr);
+  no_transport(*mock);
 }

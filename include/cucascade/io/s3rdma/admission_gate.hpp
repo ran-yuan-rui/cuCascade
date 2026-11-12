@@ -318,6 +318,11 @@ class admission_gate {
   [[nodiscard]] bool terminal() const noexcept;
   [[nodiscard]] std::exception_ptr first_fatal() const noexcept;
 
+  /// Null while the gate is not terminal; afterwards the error admission
+  /// calls report: the first fatal error when one was latched, otherwise the
+  /// closed error.
+  [[nodiscard]] std::exception_ptr terminal_error() const noexcept;
+
   [[nodiscard]] std::uint64_t fail_stop_total() const noexcept;         ///< first-fatal latches
   [[nodiscard]] std::uint64_t envelope_wait_total() const noexcept;     ///< submits that blocked
   [[nodiscard]] std::uint64_t envelope_wait_ns_total() const noexcept;  ///< summed blocked time

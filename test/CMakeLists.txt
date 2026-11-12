@@ -147,27 +147,66 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_IO)
 endif()
 
 if(CUCASCADE_BUILD_S3_RDMA)
-  # S3-over-RDMA component test executable. It uses Catch2's own main instead of
-  # unittest.cpp: no GPU pool is created and no device is touched.
+  # S3-over-RDMA component tests. They use Catch2's own main instead of
+  # unittest.cpp: no GPU pool is created. cucascade_s3rdma_tests replaces the
+  # component's CUDA calls and runs without a GPU; cucascade_s3rdma_gpu_tests
+  # needs one device.
+  set(CUCASCADE_S3RDMA_TEST_SUPPORT io/s3rdma/mock_rdma_client.cpp
+                                    io/s3rdma/runtime_test_support.cpp)
+
+  # Started by the tests that expect the process to terminate; not a CTest
+  # entry.
+  add_executable(
+    cucascade_s3rdma_death_helper ${CUCASCADE_S3RDMA_TEST_SUPPORT}
+                                  io/s3rdma/s3rdma_death_helper.cpp)
+
   add_executable(
     cucascade_s3rdma_tests
-    io/s3rdma/mock_rdma_client.cpp
+    ${CUCASCADE_S3RDMA_TEST_SUPPORT}
     io/s3rdma/test_admission_gate.cpp
     io/s3rdma/test_mock_rdma_client.cpp
+    io/s3rdma/test_s3rdma_delivery.cpp
+    io/s3rdma/test_s3rdma_host.cpp
     io/s3rdma/test_s3rdma_ioctx_skeleton.cpp
+    io/s3rdma/test_s3rdma_runtime.cpp
     # Replaces the global operator new for the whole test binary
     utils/allocation_counter.cpp)
 
-  target_include_directories(
-    cucascade_s3rdma_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
-                                   ${CMAKE_CURRENT_SOURCE_DIR}/utils)
+  add_executable(
+    cucascade_s3rdma_gpu_tests
+    ${CUCASCADE_S3RDMA_TEST_SUPPORT} io/s3rdma/test_s3rdma_gpu.cpp
+    # Replaces the global operator new for the whole test binary
+    utils/allocation_counter.cpp)
 
+  foreach(target cucascade_s3rdma_death_helper cucascade_s3rdma_tests
+                 cucascade_s3rdma_gpu_tests)
+    target_include_directories(
+      ${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/utils)
+  endforeach()
+
+  target_link_libraries(cucascade_s3rdma_death_helper
+                        PRIVATE cucascade_io_s3rdma Catch2::Catch2)
   target_link_libraries(cucascade_s3rdma_tests PRIVATE cucascade_io_s3rdma
                                                        Catch2::Catch2WithMain)
+  target_link_libraries(cucascade_s3rdma_gpu_tests
+                        PRIVATE cucascade_io_s3rdma Catch2::Catch2WithMain)
+  add_dependencies(cucascade_s3rdma_tests cucascade_s3rdma_death_helper)
 
   add_test(NAME cucascade_s3rdma_tests COMMAND cucascade_s3rdma_tests --order
                                                decl)
-  set_tests_properties(cucascade_s3rdma_tests PROPERTIES TIMEOUT 180)
+  set_tests_properties(
+    cucascade_s3rdma_tests
+    PROPERTIES
+      TIMEOUT
+      300
+      ENVIRONMENT
+      "CUDA_VISIBLE_DEVICES=;S3RDMA_DEATH_HELPER=$<TARGET_FILE:cucascade_s3rdma_death_helper>"
+  )
+
+  add_test(NAME cucascade_s3rdma_gpu_tests COMMAND cucascade_s3rdma_gpu_tests
+                                                   --order decl)
+  set_tests_properties(cucascade_s3rdma_gpu_tests PROPERTIES TIMEOUT 300)
 endif()
 
 if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)

@@ -43,6 +43,7 @@ TEST_CASE("S3RDMA gate validates geometry and overflow before allocating the rin
   rdma::config cfg;
   cfg.max_inflight    = 2;
   cfg.arena_slot_size = 1;
+  cfg.devices         = {7};
   CHECK(rdma::sanitized(cfg).queue_cap == 8);
   cfg.queue_cap = 3;
   CHECK(rdma::sanitized(cfg).queue_cap == 3);

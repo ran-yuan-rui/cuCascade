@@ -24,6 +24,7 @@ int main()
     rdma::config cfg;
     cfg.max_inflight    = 2;
     cfg.arena_slot_size = 1;
+    cfg.devices         = {0};
     auto normalized     = rdma::sanitized(cfg);
     if (normalized.queue_cap != 8 || normalized.max_inflight != 2 ||
         normalized.arena_slot_size != 1 || normalized.min_alignment_requirement() != 1 ||

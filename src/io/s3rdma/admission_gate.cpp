@@ -463,6 +463,12 @@ std::exception_ptr admission_gate::first_fatal() const noexcept
   return _first_fatal;
 }
 
+std::exception_ptr admission_gate::terminal_error() const noexcept
+{
+  std::lock_guard lock{_mutex};
+  return _closed ? terminal_error_locked() : nullptr;
+}
+
 std::uint64_t admission_gate::fail_stop_total() const noexcept
 {
   return _fail_stop_total.load(std::memory_order_relaxed);

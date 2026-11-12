@@ -41,6 +41,13 @@ enum class errc {
   request_canceled,
   /// An internal invariant was broken, for example work dropped without a result.
   internal_error,
+  /// A data-plane transfer did not complete exactly, or the registered memory
+  /// could not be released.  The backend admits no further work.
+  transport_failed,
+  /// A CUDA call needed to deliver data failed.
+  device_failed,
+  /// A control-plane (HTTP) operation failed.
+  control_failed,
 };
 
 /**

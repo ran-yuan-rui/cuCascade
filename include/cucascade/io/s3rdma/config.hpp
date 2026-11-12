@@ -20,15 +20,16 @@
 
 #include <cstddef>
 #include <optional>
+#include <vector>
 
 namespace cucascade::io::s3rdma {
 
 /**
  * @brief Geometry and queueing configuration of the S3-over-RDMA reactor.
  *
- * @c max_inflight and @c arena_slot_size have no usable default: the embedder
- * sets both, and @ref sanitized rejects a configuration that leaves either at
- * zero.
+ * @c max_inflight, @c arena_slot_size and @c devices have no usable default:
+ * the embedder sets them, and @ref sanitized rejects a configuration that
+ * leaves any of them empty or zero.
  */
 struct config {
   /// Number of GETs that may be outstanding at once.  Required (> 0).
@@ -46,6 +47,12 @@ struct config {
   /// backend out of readahead scheduling.
   std::size_t n_max_concurrent_scans{0};
 
+  /// CUDA device ids the backend delivers to.  Each one gets a registered
+  /// landing arena of @ref arena_bytes bytes when the backend starts; a read
+  /// for any other device is refused.  Required: non-empty, no negative id, no
+  /// duplicate.
+  std::vector<int> devices{};
+
   /// An object store addresses single bytes.
   [[nodiscard]] std::size_t min_alignment_requirement() const noexcept { return 1; }
 
@@ -60,11 +67,20 @@ struct config {
  *
  * @return @p cfg with @c queue_cap set.
  * @throws std::invalid_argument @c max_inflight is zero, @c arena_slot_size is
- *         zero, or @c queue_cap is set to zero.
+ *         zero, @c queue_cap is set to zero, or @c devices is empty or holds a
+ *         negative or repeated id.
  * @throws std::overflow_error @c max_inflight x @c arena_slot_size overflows,
  *         or @c queue_cap is unset and 4 x @c max_inflight overflows (checked
  *         in that order).
  */
 [[nodiscard]] config sanitized(config cfg);
+
+/**
+ * @brief Device memory one landing arena occupies: @c max_inflight x
+ * @c arena_slot_size bytes, on each device of @c config::devices.
+ *
+ * @throws std::invalid_argument the product overflows.
+ */
+[[nodiscard]] std::size_t arena_bytes(config const& cfg);
 
 }  // namespace cucascade::io::s3rdma
