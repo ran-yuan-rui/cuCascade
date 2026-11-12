@@ -20,6 +20,7 @@ target_sources(
   cucascade_io_s3rdma_objects
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/admission_gate.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/config.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/cuda_delivery.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/errors.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/s3rdma_ioctx.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/s3rdma_reactor.cpp)
