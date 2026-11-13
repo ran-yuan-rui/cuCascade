@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include "call_admission.hpp"
+
 #include <cucascade/io/s3rdma/client.hpp>
 #include <cucascade/io/s3rdma/cuda_delivery.hpp>
 
@@ -47,18 +49,21 @@ enum class arena_release : std::uint8_t {
   released,       ///< deregistered and freed; the registrar is gone
   retained,       ///< a step failed or its outcome is unknown; the arena keeps what it held
   context_fatal,  ///< freeing reported an error for which @ref is_context_fatal holds
+  stopped,        ///< a step may no longer start; the arena keeps what it still held
 };
 
 /**
  * @brief Deregister @p block, then free it, then drop its registrar.
  *
- * Stops at the first step that fails and leaves the rest untouched.  The
- * device of the block must be current on the calling thread.
+ * Each step is a call admitted by @p calls.  The release stops at the first
+ * step that is refused or fails and leaves the rest untouched.  The device of
+ * the block must be current on the calling thread.
  *
  * @param[out] code The CUDA error of a failed free; unchanged otherwise.
  */
 [[nodiscard]] arena_release release(arena& block,
                                     cuda_delivery_ops const& ops,
+                                    call_admission& calls,
                                     cudaError_t& code) noexcept;
 
 }  // namespace cucascade::io::s3rdma::detail

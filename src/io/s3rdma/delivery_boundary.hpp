@@ -38,8 +38,9 @@ template <typename Call>
   }
 }
 
-/// Destroy @p event.  A failure is logged and otherwise ignored: by now the
-/// work the event stood for is finished.
+/// Destroy @p event after the copy it stood for completed.  A failure is
+/// logged and otherwise ignored: the delivery stands.  Not for an event whose
+/// copy never started; there the caller has to look at the result.
 void destroy_event(cuda_delivery_ops const& ops, cudaEvent_t event) noexcept;
 
 /**

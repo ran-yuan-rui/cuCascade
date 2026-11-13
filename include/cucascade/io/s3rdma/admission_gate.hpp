@@ -154,8 +154,9 @@ class admission_gate {
     bool _admitted{false};
   };
 
-  /// Move-only permit covering one control-plane call.  Held permits keep close
-  /// completion pending.
+  /// Move-only permit covering one call made on a caller's thread: a
+  /// control-plane call, or handing a device request to the reactor.  Held
+  /// permits keep close completion pending.
   class admission_permit {
    public:
     admission_permit(admission_permit&& other) noexcept;

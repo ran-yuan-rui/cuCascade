@@ -41,13 +41,39 @@ struct write_probe_result {
   bool host_flush_supported{false};
 };
 
+/// A call of the backend, as @c cuda_delivery_ops::before_call names it.
+enum class backend_call : std::uint8_t {
+  get_device,
+  set_device,
+  probe_writes,
+  malloc_device,
+  free_device,
+  stream_capture_query,
+  event_create,
+  flush,
+  memcpy_async,  ///< the copy out of the landing memory, with its event record and wait
+  event_destroy,
+  session_acquire,
+  session_release,
+  register_memory,
+  capacity_query,
+  deregister_memory,
+  data_get,
+  control_head,
+  control_range_get,
+  /// The framework's preparation of a device request, which asks CUDA for the
+  /// current device.
+  dispatch,
+};
+
 /**
  * @brief The CUDA calls the backend makes, as replaceable callables.
  *
  * @ref default_delivery_ops binds each member to the CUDA runtime.  A caller
- * may replace individual members; every member must stay callable.  The
- * callables are invoked from the thread that starts or closes the backend and
- * from its worker threads.
+ * may replace individual members; every member except @c before_call must
+ * stay callable.  The callables are invoked from the thread that starts or
+ * closes the backend, from its worker threads and, for @c get_device and
+ * @c before_call, from threads that submit requests.
  */
 struct cuda_delivery_ops {
   std::function<cudaError_t(int*)> get_device;
@@ -81,14 +107,36 @@ struct cuda_delivery_ops {
    * the process if the hook returns or throws.  The hook must not block.
    */
   std::function<void(char const* what, cudaError_t rc)> fatal_hook;
+
+  /**
+   * @brief Optional observer of the backend's CUDA and transport calls; may be
+   * empty.
+   *
+   * The backend starts each of those calls through one admission decision,
+   * which refuses the call once a CUDA error left the context unusable.
+   * @c before_call runs on the calling thread immediately before that
+   * decision and is not told its result.  It may block, which holds the
+   * thread at the decision.  It must not throw and must not call back into
+   * the backend.  Meant for tests and tracing.
+   */
+  std::function<void(backend_call call)> before_call;
 };
 
-/// The operations bound to the CUDA runtime.  Its @c fatal_hook writes one line
-/// to standard error without blocking and returns.
+/**
+ * @brief The operations bound to the CUDA runtime.
+ *
+ * Its @c fatal_hook writes one line and ends the process with
+ * @c std::abort(), without running the terminate handler.  The line is
+ * written only where a write cannot block.  Standard error is examined when
+ * this function is called: if it is a pipe, a socket or a terminal, the hook
+ * holds its own non-blocking handle to it, which stays open for as long as
+ * the hook exists, and writes there.  For any other standard error, a regular
+ * file included, no line is written.
+ */
 [[nodiscard]] cuda_delivery_ops default_delivery_ops();
 
-/// @throws std::invalid_argument a member of @p ops is not callable.  Calls
-///         none of them.
+/// @throws std::invalid_argument a member of @p ops other than
+///         @c before_call is not callable.  Calls none of them.
 void validate(cuda_delivery_ops const& ops);
 
 /**
@@ -116,8 +164,11 @@ struct context_fatal_report {
  * error for which @ref is_context_fatal holds.
  *
  * Called at most once per backend instance, after the backend stopped
- * admitting work and stopped calling CUDA and the transport.  Its landing
- * memory stays allocated and registered.  The policy may terminate the
+ * admitting work and stopped starting CUDA and transport calls.  A call that
+ * had already started still returns, and a copy out of the landing memory
+ * that was already submitted is still waited for.  Landing memory that was
+ * allocated stays allocated and registered; when the error occurs while the
+ * backend starts, there may be none yet.  The policy may terminate the
  * process or return; an exception leaving it terminates the process.  It must
  * not call back into the backend.  An empty policy is not called.
  */

@@ -21,12 +21,17 @@
 #include <cuda_runtime.h>
 
 #include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
+#include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <memory>
 #include <stdexcept>
 
 namespace cucascade::io::s3rdma {
@@ -82,10 +87,60 @@ cudaError_t probe_device_writes(int device, write_probe_result* out)
   return cudaSuccess;
 }
 
-// One write of a bounded line.  Standard error is switched to non-blocking for
-// the write so that a reader that stopped draining it cannot delay the caller.
-void report_fatal(char const* what, cudaError_t rc) noexcept
+/**
+ * Where the default fatal hook writes its line, decided before any failure.
+ *
+ * The hook does not write to standard error itself.  That write blocks when
+ * the reader stopped, and switching standard error to non-blocking would
+ * change a file description this process shares with others.  It writes only
+ * through a handle on which a write cannot block, and not at all when
+ * standard error offers none.
+ */
+struct fatal_sink {
+  fatal_sink() noexcept;
+  ~fatal_sink()
+  {
+    if (fd >= 0) { (void)::close(fd); }
+  }
+  fatal_sink(fatal_sink const&)            = delete;
+  fatal_sink& operator=(fatal_sink const&) = delete;
+
+  int fd{-1};          ///< -1: nothing is written
+  bool socket{false};  ///< written with send(), which is non-blocking per call
+};
+
+fatal_sink::fatal_sink() noexcept
 {
+  struct stat target{};
+  if (::fstat(STDERR_FILENO, &target) != 0) { return; }
+  if (S_ISSOCK(target.st_mode)) {
+    fd     = ::fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 3);
+    socket = fd >= 0;
+    return;
+  }
+  // A pipe and a terminal honor O_NONBLOCK.  A regular file does not, and
+  // nothing bounds a write to one.
+  bool const terminal = S_ISCHR(target.st_mode) && ::isatty(STDERR_FILENO) == 1;
+  if (!S_ISFIFO(target.st_mode) && !terminal) { return; }
+  // Opening the file again gives a file description of its own, so the
+  // O_NONBLOCK set here is not seen through standard error.
+  int const opened = ::open("/proc/self/fd/2", O_WRONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
+  if (opened < 0) { return; }
+  struct stat reopened{};
+  int const flags = ::fcntl(opened, F_GETFL);
+  if (::fstat(opened, &reopened) != 0 || reopened.st_dev != target.st_dev ||
+      reopened.st_ino != target.st_ino || flags == -1 || (flags & O_NONBLOCK) == 0) {
+    (void)::close(opened);
+    return;
+  }
+  fd = opened;
+}
+
+// One bounded line.  Nothing here allocates, and nothing is written unless the
+// write is known not to block.
+void report_fatal(fatal_sink const& sink, char const* what, cudaError_t rc) noexcept
+{
+  if (sink.fd < 0) { return; }
   std::array<char, 256> line{};
   std::size_t used  = 0;
   auto const append = [&](char const* text) {
@@ -99,10 +154,19 @@ void report_fatal(char const* what, cudaError_t rc) noexcept
   append(": ");
   append(cudaGetErrorName(rc));
   append("\n");
-  int const flags = ::fcntl(STDERR_FILENO, F_GETFL);
-  if (flags != -1) { (void)::fcntl(STDERR_FILENO, F_SETFL, flags | O_NONBLOCK); }
-  [[maybe_unused]] auto const written = ::write(STDERR_FILENO, line.data(), used);
-  if (flags != -1) { (void)::fcntl(STDERR_FILENO, F_SETFL, flags); }
+  if (sink.socket) {
+    [[maybe_unused]] auto const sent =
+      ::send(sink.fd, line.data(), used, MSG_DONTWAIT | MSG_NOSIGNAL);
+    return;
+  }
+  // A reader that went away raises SIGPIPE, and a terminal may stop a
+  // background writer with SIGTTOU.  Neither may happen to this thread.
+  sigset_t quiet;
+  if (::sigemptyset(&quiet) != 0 || ::sigaddset(&quiet, SIGPIPE) != 0 ||
+      ::sigaddset(&quiet, SIGTTOU) != 0 || ::pthread_sigmask(SIG_BLOCK, &quiet, nullptr) != 0) {
+    return;
+  }
+  [[maybe_unused]] auto const written = ::write(sink.fd, line.data(), used);
 }
 
 }  // namespace
@@ -134,7 +198,11 @@ cuda_delivery_ops default_delivery_ops()
   };
   ops.event_synchronize = [](cudaEvent_t event) { return cudaEventSynchronize(event); };
   ops.event_destroy     = [](cudaEvent_t event) { return cudaEventDestroy(event); };
-  ops.fatal_hook        = &report_fatal;
+  ops.fatal_hook = [sink = std::make_shared<fatal_sink const>()](char const* what, cudaError_t rc) {
+    report_fatal(*sink, what, rc);
+    // Not std::terminate(): its handler may write to standard error and block.
+    std::abort();
+  };
   return ops;
 }
 

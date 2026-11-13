@@ -45,7 +45,10 @@ namespace cucascade::io::s3rdma {
  *
  * Nothing is served before @c start() succeeded: reads and opens fail with
  * @c errc::backend_unavailable.  Once the backend stopped after a failure,
- * every entry reports the error it stopped with.
+ * every entry reports the error it stopped with.  Some requests are answered
+ * without the backend, and so in the same way in every state: a read of no
+ * slices, a host read of no bytes or from at or beyond the end of the object,
+ * and a request that is invalid or that the backend does not serve.
  *
  * The backend has no cache and serves no host-to-device read.  A device read
  * lands in caller device memory only; host reads run on the calling thread

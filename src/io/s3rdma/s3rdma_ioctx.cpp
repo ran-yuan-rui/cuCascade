@@ -49,6 +49,22 @@ s3rdma_io_object const& typed(io_object const& object)
   return *result;
 }
 
+/// Fail the slices that read nothing from @p object: an empty range, or one
+/// that starts at or beyond its end.  True when a slice is left to read.
+bool fail_unread(s3rdma_io_object const& object, std::vector<prepared_io_slice>& slices) noexcept
+{
+  bool pending = false;
+  for (auto& slice : slices) {
+    if (slice.rng.size != 0 && slice.rng.offset < object.size()) {
+      pending = true;
+    } else if (slice.on_complete != nullptr) {
+      (*slice.on_complete)(slice.h_buffer.fragments(), false);
+      slice.on_complete.reset();
+    }
+  }
+  return pending;
+}
+
 }  // namespace
 
 s3rdma_ioctx::s3rdma_ioctx(config cfg,
@@ -82,9 +98,21 @@ exec::semi_future<std::size_t> s3rdma_ioctx::mixed_readv_async_io(
     });
   // Decided here, before the framework dispatches: it asks CUDA for the
   // current device first, which a stopped backend must not do.
-  auto const refusal = device_only ? reactor().admission_error() : _unsupported;
+  std::exception_ptr refusal = device_only ? reactor().admission_error() : _unsupported;
   if (refusal == nullptr) {
-    return templated_ioctx<s3rdma_reactor>::mixed_readv_async_io(object, std::move(slices));
+    // The framework fails a slice that reads nothing through its callback and
+    // then asks CUDA for the current device.  Those callbacks run here, before
+    // the request is admitted: nothing may come between the admission and
+    // that CUDA call.
+    auto const* target = dynamic_cast<s3rdma_io_object const*>(&object);
+    if (target != nullptr && !fail_unread(*target, slices)) {
+      return exec::make_semi_future<std::size_t>(0);
+    }
+    // The admission lasts until the framework has queued the request or
+    // reported why it could not, so that closing the backend waits for both.
+    if (auto const admitted = reactor().admit_dispatch(refusal)) {
+      return templated_ioctx<s3rdma_reactor>::mixed_readv_async_io(object, std::move(slices));
+    }
   }
   for (auto& slice : slices) {
     if (slice.on_complete != nullptr) {

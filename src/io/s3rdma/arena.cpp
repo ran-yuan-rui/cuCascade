@@ -20,9 +20,14 @@
 
 namespace cucascade::io::s3rdma::detail {
 
-arena_release release(arena& block, cuda_delivery_ops const& ops, cudaError_t& code) noexcept
+arena_release release(arena& block,
+                      cuda_delivery_ops const& ops,
+                      call_admission& calls,
+                      cudaError_t& code) noexcept
 {
   if (block.registered) {
+    auto const entered = calls.enter(backend_call::deregister_memory);
+    if (!entered) { return arena_release::stopped; }
     if (block.registrar == nullptr || !block.registrar->deregister_memory(block.base)) {
       return arena_release::retained;
     }
@@ -30,10 +35,14 @@ arena_release release(arena& block, cuda_delivery_ops const& ops, cudaError_t& c
   }
   if (block.base != nullptr) {
     cudaError_t rc = cudaErrorUnknown;
-    try {
-      rc = ops.free_device(block.base);
-    } catch (...) {
-      rc = cudaErrorUnknown;
+    {
+      auto const entered = calls.enter(backend_call::free_device);
+      if (!entered) { return arena_release::stopped; }
+      try {
+        rc = ops.free_device(block.base);
+      } catch (...) {
+        rc = cudaErrorUnknown;
+      }
     }
     if (rc != cudaSuccess) {
       code = rc;
@@ -41,6 +50,8 @@ arena_release release(arena& block, cuda_delivery_ops const& ops, cudaError_t& c
     }
     block.base = nullptr;
   }
+  auto const entered = calls.enter(backend_call::session_release);
+  if (!entered) { return arena_release::stopped; }
   block.registrar.reset();
   return arena_release::released;
 }

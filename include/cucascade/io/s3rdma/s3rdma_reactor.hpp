@@ -60,14 +60,25 @@ class s3rdma_io_object final : public io_object {
   std::size_t _size;
 };
 
-/// Counters of one backend instance.  Totals only grow; peaks are high-water marks.
+/**
+ * @brief Counters of one backend instance.  Totals only grow; peaks are
+ * high-water marks.
+ *
+ * @c short_read_total counts only a transfer that completed and reported
+ * fewer bytes than asked.  It is not the number of transfers that did not
+ * complete exactly: the first of those stops the backend, and
+ * @c fail_stop_total counts that stop like one for any other failure.
+ * @c flush_total counts flushes that succeeded.  @c inflight_peak covers a
+ * chunk from the moment a worker takes it until it is settled, not only
+ * while its transfer is on the wire.
+ */
 struct perf_snapshot {
   std::uint64_t bytes_total{0};             ///< bytes copied to caller device memory
   std::uint64_t requests_total{0};          ///< device requests admitted
   std::uint64_t error_total{0};             ///< chunks that failed
-  std::uint64_t short_read_total{0};        ///< transfers that reported fewer bytes than asked
+  std::uint64_t short_read_total{0};        ///< completed transfers that reported too few bytes
   std::uint64_t retries_total{0};           ///< data-plane transfers issued again; always zero
-  std::uint64_t flush_total{0};             ///< GPUDirect RDMA write flushes performed
+  std::uint64_t flush_total{0};             ///< GPUDirect RDMA write flushes that succeeded
   std::uint64_t slot_wait_total{0};         ///< waits for a landing slot; always zero
   std::uint64_t inflight_peak{0};           ///< chunks being worked on at once
   std::uint64_t slots_in_use_peak{0};       ///< landing slots holding a transfer at once
@@ -187,8 +198,10 @@ class s3rdma_reactor {
   /**
    * @brief Allocate and register the landing arenas and start the workers.
    *
-   * Calls CUDA on the calling thread and puts its current device back
-   * afterwards.  A second call after success does nothing.
+   * Calls CUDA on the calling thread and then tries to put that thread's
+   * current device back.  If that fails the start fails; when the start had
+   * already failed, it is only logged.  A second call after success does
+   * nothing.
    *
    * @throws std::exception the backend did not start.  Everything acquired
    *         was released again unless a release failed or a CUDA error left
@@ -200,10 +213,14 @@ class s3rdma_reactor {
   /**
    * @brief Stop admitting work, wait for work in progress, release everything.
    *
-   * Queued requests fail.  Landing memory that may still be written to, or
-   * whose release fails, is kept allocated and @ref status reports it.
-   * Idempotent; concurrent callers wait for the first.  Must not be called
-   * from a worker, a completion callback or the health policy.
+   * Queued requests fail.  Work in progress includes a device request that
+   * the I/O context is still handing to the reactor, with the check of the
+   * CUDA context it makes when that fails.  Landing memory that may still be
+   * written to, or whose release fails, is kept allocated and @ref status
+   * reports it.  The calling thread's CUDA device is put back afterwards if
+   * possible; a failure to do so is logged.  Idempotent; concurrent callers
+   * wait for the first.  Must not be called from a worker, a completion
+   * callback or the health policy.
    */
   void shutdown() noexcept;
 
@@ -275,8 +292,30 @@ class s3rdma_reactor {
   void context_fatal(int device, cudaError_t code, char const* what) noexcept;
   void fail_closed(std::exception_ptr fatal) noexcept;
 
+  /// One device request on its way from the I/O context to the reactor.
+  /// @ref shutdown waits until it is destroyed.
+  class dispatch_scope {
+   public:
+    dispatch_scope(dispatch_scope&& other) noexcept;
+    dispatch_scope(dispatch_scope const&)            = delete;
+    dispatch_scope& operator=(dispatch_scope const&) = delete;
+    dispatch_scope& operator=(dispatch_scope&&)      = delete;
+    ~dispatch_scope();
+
+   private:
+    friend class s3rdma_reactor;
+    dispatch_scope(admission_gate::admission_permit permit, s3rdma_reactor* owner) noexcept;
+    admission_gate::admission_permit _permit;
+    s3rdma_reactor* _owner;
+  };
+
   /// Null when a device request may be queued; otherwise why not.
   [[nodiscard]] std::exception_ptr admission_error() const noexcept;
+  /// The error the backend stopped with.
+  [[nodiscard]] std::exception_ptr stop_error() const noexcept;
+  /// Admit the I/O context to hand one device request to the reactor.  No
+  /// value, with @p refusal set, when it may not.
+  [[nodiscard]] std::optional<dispatch_scope> admit_dispatch(std::exception_ptr& refusal) noexcept;
   [[nodiscard]] std::shared_ptr<io_object> open(std::string path);
   void check_device_health() noexcept;
 

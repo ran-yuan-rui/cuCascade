@@ -17,6 +17,7 @@
  */
 
 #include "arena.hpp"
+#include "call_admission.hpp"
 #include "delivery_boundary.hpp"
 
 #include <cucascade/io/io_utils.hpp>
@@ -28,6 +29,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <condition_variable>
 #include <limits>
@@ -48,7 +50,8 @@ namespace cucascade::io::s3rdma {
 struct s3rdma_reactor::runtime {
   enum class stage : std::uint8_t { created, starting, serving, failed, closing, closed };
 
-  runtime(config const& cfg, runtime_status* published) : status(published)
+  runtime(config const& cfg, cuda_delivery_ops const& ops, runtime_status* published)
+    : status(published), calls(ops.before_call)
   {
     arenas.resize(cfg.devices.size());
     for (std::size_t i = 0; i < arenas.size(); ++i) {
@@ -72,19 +75,27 @@ struct s3rdma_reactor::runtime {
   // back: destroying them would call the transport or CUDA.
   ~runtime()
   {
-    bool const abandon = halted() || poisoned.load(std::memory_order_acquire);
+    bool const abandon = calls.stopped() || poisoned.load(std::memory_order_acquire);
     for (auto& session : sessions) {
       if (abandon) { (void)session.release(); }
     }
     for (auto& block : arenas) {
-      if (block.base != nullptr || block.registered) { (void)block.registrar.release(); }
+      if (abandon || block.base != nullptr || block.registered) { (void)block.registrar.release(); }
     }
   }
 
   runtime(runtime const&)            = delete;
   runtime& operator=(runtime const&) = delete;
 
-  [[nodiscard]] bool halted() const noexcept { return no_touch.load(std::memory_order_acquire); }
+  /// Run one CUDA call, unless calls may no longer start: then there is no
+  /// result.  An exception counts as @c cudaErrorUnknown.
+  template <typename Call>
+  [[nodiscard]] std::optional<cudaError_t> cuda(backend_call call, Call&& run) noexcept
+  {
+    auto const entered = calls.enter(call);
+    if (!entered) { return std::nullopt; }
+    return detail::guarded(std::forward<Call>(run));
+  }
 
   [[nodiscard]] detail::arena* find_arena(int device_id) noexcept
   {
@@ -118,8 +129,11 @@ struct s3rdma_reactor::runtime {
 
   std::atomic<bool> bound{false};     ///< a reactor uses this context
   std::atomic<bool> serving{false};   ///< start succeeded
-  std::atomic<bool> no_touch{false};  ///< no further CUDA or transport call may start
   std::atomic<bool> poisoned{false};  ///< a failure was latched: the arenas stay
+
+  /// Admits every CUDA and transport call; stopped by a CUDA error that
+  /// leaves the context unusable.
+  detail::call_admission calls;
 
   std::atomic<std::uint64_t> bytes_total{0};
   std::atomic<std::uint64_t> requests_total{0};
@@ -276,6 +290,16 @@ void log_stop(char const* event, std::exception_ptr const& cause) noexcept
   }
 }
 
+/// Record a CUDA failure that changes nothing else.
+void log_ignored(char const* event, cudaError_t rc) noexcept
+{
+  try {
+    CUCASCADE_LOG_WARN("s3rdma: {}: {}", event, cudaGetErrorName(rc));
+  } catch (...) {
+    // Nothing else can be done with a failure to report.
+  }
+}
+
 void close_gate(admission_gate& gate) noexcept
 {
   auto batch = gate.begin_close();
@@ -283,11 +307,13 @@ void close_gate(admission_gate& gate) noexcept
   if (batch.has_token()) { gate.complete_drain(std::move(batch).take_token()); }
 }
 
-/// Outcome of building one arena: a failed CUDA call, another failure, or neither.
+/// Outcome of building one arena: a failed CUDA call, a call that may no
+/// longer start, another failure, or none of them.
 struct startup_step {
   cudaError_t code{cudaSuccess};
   char const* what{nullptr};
   std::exception_ptr failure;
+  bool refused{false};
 };
 
 /// Allocate and register @p block on its device.  What was acquired before a
@@ -296,10 +322,17 @@ startup_step create_arena(detail::arena& block,
                           std::size_t bytes,
                           std::size_t slot,
                           cuda_delivery_ops const& ops,
+                          detail::call_admission& calls,
                           rdma_data_session_factory& sessions) noexcept
 {
   startup_step step;
-  auto const ok = [&](cudaError_t rc, char const* what) noexcept {
+  auto const ok = [&](backend_call call, char const* what, auto&& run) noexcept {
+    auto const entered = calls.enter(call);
+    if (!entered) {
+      step.refused = true;
+      return false;
+    }
+    auto const rc = guarded(run);
     if (rc != cudaSuccess) {
       step.code = rc;
       step.what = what;
@@ -307,10 +340,13 @@ startup_step create_arena(detail::arena& block,
     return rc == cudaSuccess;
   };
   auto const device = block.device;
-  if (!ok(guarded([&] { return ops.set_device(device); }), "cudaSetDevice")) { return step; }
+  if (!ok(backend_call::set_device, "cudaSetDevice", [&] { return ops.set_device(device); })) {
+    return step;
+  }
   write_probe_result probe;
-  if (!ok(guarded([&] { return ops.probe_writes(device, &probe); }),
-          "the GPUDirect RDMA write-ordering query")) {
+  if (!ok(backend_call::probe_writes, "the GPUDirect RDMA write-ordering query", [&] {
+        return ops.probe_writes(device, &probe);
+      })) {
     return step;
   }
   try {
@@ -336,24 +372,44 @@ startup_step create_arena(detail::arena& block,
     return step;
   }
   void* memory = nullptr;
-  if (!ok(guarded([&] { return ops.malloc_device(&memory, bytes); }), "cudaMalloc")) {
+  if (!ok(backend_call::malloc_device, "cudaMalloc", [&] {
+        return ops.malloc_device(&memory, bytes);
+      })) {
     return step;
   }
   block.base  = static_cast<std::uint8_t*>(memory);
   block.bytes = bytes;
+  // True when the transport call may start; otherwise the step is refused.
+  auto const admitted = [&](detail::call_admission::scope const& entered) noexcept {
+    if (!entered) { step.refused = true; }
+    return static_cast<bool>(entered);
+  };
   try {
     if (block.base == nullptr) {
       throw error{errc::device_failed, "s3rdma: the landing arena allocation returned no memory"};
     }
-    block.registrar = sessions.acquire();
+    {
+      auto const entered = calls.enter(backend_call::session_acquire);
+      if (!admitted(entered)) { return step; }
+      block.registrar = sessions.acquire();
+    }
     if (block.registrar == nullptr) {
       throw error{errc::backend_unavailable,
                   "s3rdma: the data-session factory returned no session"};
     }
-    block.registrar->register_memory(block.base, bytes);
-    block.registered = true;
+    {
+      auto const entered = calls.enter(backend_call::register_memory);
+      if (!admitted(entered)) { return step; }
+      block.registrar->register_memory(block.base, bytes);
+      block.registered = true;
+    }
     // Checked while still signed: a negative value means the size is unknown.
-    auto const capacity = block.registrar->max_request_callback_size(block.base);
+    std::int64_t capacity = -1;
+    {
+      auto const entered = calls.enter(backend_call::capacity_query);
+      if (!admitted(entered)) { return step; }
+      capacity = block.registrar->max_request_callback_size(block.base);
+    }
     if (capacity < 0 || static_cast<std::uint64_t>(capacity) < slot) {
       throw error{errc::backend_unavailable,
                   "s3rdma: the registered arena cannot receive arena_slot_size bytes in one GET"};
@@ -380,21 +436,50 @@ bool device_request(grouped_io_request const& request, config const& cfg) noexce
     });
 }
 
-/// First byte position of a `Content-Range: bytes <first>-<last>/<size>` value.
+/// Take a decimal number off the front of @p text.  No value when there is no
+/// digit or the number does not fit.
+std::optional<std::size_t> take_number(std::string_view& text) noexcept
+{
+  std::size_t number = 0;
+  std::size_t digits = 0;
+  while (digits < text.size() && text[digits] >= '0' && text[digits] <= '9') {
+    auto const digit = static_cast<std::size_t>(text[digits] - '0');
+    if (number > (std::numeric_limits<std::size_t>::max() - digit) / 10) { return std::nullopt; }
+    number = number * 10 + digit;
+    ++digits;
+  }
+  if (digits == 0) { return std::nullopt; }
+  text.remove_prefix(digits);
+  return number;
+}
+
+bool take(std::string_view& text, char expected) noexcept
+{
+  if (text.empty() || text.front() != expected) { return false; }
+  text.remove_prefix(1);
+  return true;
+}
+
+/**
+ * First byte position of a `Content-Range: bytes <first>-<last>/<length>`
+ * value, where `<length>` is a number or `*`.
+ *
+ * The whole value must have that form and name a possible range: first no
+ * greater than last, and last below a given length.  Anything else, text
+ * after the value included, yields no position.
+ */
 std::optional<std::size_t> content_range_start(std::string_view value) noexcept
 {
   constexpr std::string_view unit{"bytes "};
   if (value.substr(0, unit.size()) != unit) { return std::nullopt; }
   value.remove_prefix(unit.size());
-  std::size_t first  = 0;
-  std::size_t digits = 0;
-  while (digits < value.size() && value[digits] >= '0' && value[digits] <= '9') {
-    auto const digit = static_cast<std::size_t>(value[digits] - '0');
-    if (first > (std::numeric_limits<std::size_t>::max() - digit) / 10) { return std::nullopt; }
-    first = first * 10 + digit;
-    ++digits;
-  }
-  if (digits == 0 || digits == value.size() || value[digits] != '-') { return std::nullopt; }
+  auto const first = take_number(value);
+  if (!first.has_value() || !take(value, '-')) { return std::nullopt; }
+  auto const last = take_number(value);
+  if (!last.has_value() || *last < *first || !take(value, '/')) { return std::nullopt; }
+  if (value == "*") { return first; }
+  auto const length = take_number(value);
+  if (!length.has_value() || !value.empty() || *length <= *last) { return std::nullopt; }
   return first;
 }
 
@@ -419,7 +504,7 @@ s3rdma_reactor::reactor_context::reactor_context(config cfg,
     _policy(std::move(policy)),
     _status(std::make_shared<runtime_status>()),
     _gate(*_cfg.queue_cap, _cfg.arena_slot_size),
-    _runtime(std::make_unique<runtime>(_cfg, _status.get()))
+    _runtime(std::make_unique<runtime>(_cfg, _delivery, _status.get()))
 {
   _gate.bind_arena_marker(&s3rdma_reactor::mark_poisoned, _runtime.get());
 }
@@ -483,8 +568,12 @@ std::exception_ptr s3rdma_reactor::bring_up() noexcept
   };
 
   int previous = -1;
-  if (auto const rc = guarded([&] { return ops.get_device(&previous); }); rc != cudaSuccess) {
-    cuda_failed(-1, rc, "cudaGetDevice");
+  if (auto const rc =
+        shared.cuda(backend_call::get_device, [&] { return ops.get_device(&previous); });
+      !rc.has_value()) {
+    failure = stop_error();
+  } else if (*rc != cudaSuccess) {
+    cuda_failed(-1, *rc, "cudaGetDevice");
   }
   bool selected = false;
   for (auto& block : shared.arenas) {
@@ -499,6 +588,7 @@ std::exception_ptr s3rdma_reactor::bring_up() noexcept
                           cfg.max_inflight * cfg.arena_slot_size,
                           cfg.arena_slot_size,
                           ops,
+                          shared.calls,
                           *_ctx->clients().data_sessions);
     } catch (...) {
       step.failure = std::current_exception();
@@ -507,12 +597,19 @@ std::exception_ptr s3rdma_reactor::bring_up() noexcept
       cuda_failed(block.device, step.code, step.what);
     } else if (step.failure != nullptr) {
       failure = step.failure;
+    } else if (step.refused) {
+      failure = stop_error();
     }
   }
-  if (selected && !shared.halted()) {
-    if (auto const rc = guarded([&] { return ops.set_device(previous); }); rc != cudaSuccess) {
-      if (failure == nullptr || is_context_fatal(rc)) {
-        cuda_failed(previous, rc, "cudaSetDevice");
+  // Putting the caller's device back is an attempt: it is not made once calls
+  // may no longer start, and its failure does not replace an earlier one.
+  if (selected) {
+    auto const rc = shared.cuda(backend_call::set_device, [&] { return ops.set_device(previous); });
+    if (rc.has_value() && *rc != cudaSuccess) {
+      if (failure == nullptr || is_context_fatal(*rc)) {
+        cuda_failed(previous, *rc, "cudaSetDevice");
+      } else {
+        log_ignored("the CUDA device of the starting thread could not be put back", *rc);
       }
     }
   }
@@ -592,8 +689,10 @@ void s3rdma_reactor::finish_teardown() noexcept
   }
   shared.cv.notify_all();
 
-  // Every claimed chunk is settled and every control call returned; then the
-  // workers are gone.  Only after both does a release touch the arenas.
+  // Every claimed chunk is settled, every control call returned and every
+  // request the I/O context was dispatching is dispatched or failed, health
+  // check included; then the workers are gone.  Only after both does a
+  // release touch the arenas, and nothing can report a failure behind it.
   _ctx->gate().await_closed();
   for (auto& thread : _threads) {
     if (thread.joinable()) { thread.join(); }
@@ -604,10 +703,15 @@ void s3rdma_reactor::finish_teardown() noexcept
   // still own a transfer: nothing is handed back.  The sessions go only once
   // every arena is released.
   auto const clean = [&]() noexcept {
-    return !shared.halted() && !shared.poisoned.load(std::memory_order_acquire);
+    return !shared.calls.stopped() && !shared.poisoned.load(std::memory_order_acquire);
   };
   if (clean()) { release_arenas(); }
-  if (clean()) { shared.sessions.clear(); }
+  if (clean()) {
+    if (auto const entered = shared.calls.enter(backend_call::session_release)) {
+      shared.sessions.clear();
+    }
+  }
+  assert(shared.calls.in_progress() == 0 && "a call is still running behind the barrier");
 
   auto const kept = shared.arenas_kept();
   shared.arena_leak_total.store(kept, std::memory_order_relaxed);
@@ -621,36 +725,44 @@ void s3rdma_reactor::release_arenas() noexcept
   auto const& ops = _ctx->delivery_ops();
   if (shared.arenas_kept() == 0) { return; }
 
-  auto const failed = [&](int device, cudaError_t rc, char const* what) noexcept {
-    if (is_context_fatal(rc)) {
-      context_fatal(device, rc, what);
-    } else {
-      fail_closed(cuda_failure(what, rc, shared.device));
+  // A CUDA call the release depends on.  False when it did not succeed: it
+  // may no longer start, or it failed and the backend stopped for that.
+  auto const succeeded = [&](int device, std::optional<cudaError_t> rc, char const* what) noexcept {
+    if (rc == cudaSuccess) { return true; }
+    if (rc.has_value()) {
+      if (is_context_fatal(*rc)) {
+        context_fatal(device, *rc, what);
+      } else {
+        fail_closed(cuda_failure(what, *rc, shared.device));
+      }
     }
+    return false;
   };
   int previous = -1;
-  if (auto const rc = guarded([&] { return ops.get_device(&previous); }); rc != cudaSuccess) {
-    failed(-1, rc, "cudaGetDevice");
+  if (!succeeded(-1,
+                 shared.cuda(backend_call::get_device, [&] { return ops.get_device(&previous); }),
+                 "cudaGetDevice")) {
     return;
   }
   int current = previous;
   for (auto& block : shared.arenas) {
     if (block.base == nullptr && !block.registered) { continue; }
     if (current != block.device) {
-      if (auto const rc = guarded([&] { return ops.set_device(block.device); });
-          rc != cudaSuccess) {
-        failed(block.device, rc, "cudaSetDevice");
+      if (!succeeded(
+            block.device,
+            shared.cuda(backend_call::set_device, [&] { return ops.set_device(block.device); }),
+            "cudaSetDevice")) {
         break;
       }
       current = block.device;
     }
     cudaError_t code   = cudaSuccess;
-    auto const outcome = detail::release(block, ops, code);
+    auto const outcome = detail::release(block, ops, shared.calls, code);
     if (outcome == detail::arena_release::released) { continue; }
     // One arena that cannot be released ends the release of all of them.
     if (outcome == detail::arena_release::context_fatal) {
       context_fatal(block.device, code, "cudaFree");
-    } else {
+    } else if (outcome == detail::arena_release::retained) {
       auto fatal = make_failure(
         errc::transport_failed, "s3rdma: a landing arena could not be released", shared.transport);
       fail_closed(fatal);
@@ -658,10 +770,16 @@ void s3rdma_reactor::release_arenas() noexcept
     }
     break;
   }
-  if (current != previous && !shared.halted()) {
-    if (auto const rc = guarded([&] { return ops.set_device(previous); });
-        rc != cudaSuccess && is_context_fatal(rc)) {
-      context_fatal(previous, rc, "cudaSetDevice");
+  // Putting the caller's device back is an attempt.  Its failure undoes no
+  // release; one that leaves the context unusable still stops the backend.
+  if (current != previous) {
+    auto const rc = shared.cuda(backend_call::set_device, [&] { return ops.set_device(previous); });
+    if (rc.has_value() && *rc != cudaSuccess) {
+      if (is_context_fatal(*rc)) {
+        context_fatal(previous, *rc, "cudaSetDevice");
+      } else {
+        log_ignored("the CUDA device of the closing thread could not be put back", *rc);
+      }
     }
   }
 }
@@ -683,18 +801,20 @@ void s3rdma_reactor::fail_closed(std::exception_ptr fatal) noexcept
 /**
  * A CUDA call reported an error that leaves the context unusable.
  *
- * The order matters.  First nothing of this backend may call CUDA or the
- * transport again: stopping admission wakes the workers, and a worker that
- * leaves must not release anything.  Then admission stops and queued requests
- * fail.  The policy runs last, before the caller reports its own request, so
- * that a policy which ends the process does so before any waiter resumes on
- * the failed context.
+ * The order matters.  First no CUDA or transport call of this backend may
+ * start any more: stopping admission wakes the workers, and a worker that
+ * leaves must not release anything.  A call that had already entered returns
+ * on its own.  Then admission stops and queued requests fail.  The policy
+ * runs last, before the caller reports the request that met the error, so
+ * that a policy which ends the process does so before that request's waiter
+ * resumes on the failed context.  Queued requests have been failed by then,
+ * and other workers report theirs independently.
  */
 void s3rdma_reactor::context_fatal(int device, cudaError_t code, char const* what) noexcept
 {
   auto& shared     = state();
   auto fatal       = cuda_failure(what, code, shared.device);
-  bool const first = !shared.no_touch.exchange(true, std::memory_order_acq_rel);
+  bool const first = shared.calls.stop();
   shared.status->_terminal.store(true, std::memory_order_release);
   fail_closed(fatal);
   if (first) {
@@ -713,10 +833,12 @@ void s3rdma_reactor::context_fatal(int device, cudaError_t code, char const* wha
 
 void s3rdma_reactor::check_device_health() noexcept
 {
-  if (state().halted()) { return; }
   int device    = -1;
-  auto const rc = guarded([&] { return _ctx->delivery_ops().get_device(&device); });
-  if (rc != cudaSuccess && is_context_fatal(rc)) { context_fatal(device, rc, "cudaGetDevice"); }
+  auto const rc = state().cuda(backend_call::get_device,
+                               [&] { return _ctx->delivery_ops().get_device(&device); });
+  if (rc.has_value() && *rc != cudaSuccess && is_context_fatal(*rc)) {
+    context_fatal(device, *rc, "cudaGetDevice");
+  }
 }
 
 std::exception_ptr s3rdma_reactor::admission_error() const noexcept
@@ -724,6 +846,52 @@ std::exception_ptr s3rdma_reactor::admission_error() const noexcept
   if (auto terminal = _ctx->gate().terminal_error()) { return terminal; }
   if (!state().serving.load(std::memory_order_acquire)) { return state().unavailable; }
   return nullptr;
+}
+
+std::exception_ptr s3rdma_reactor::stop_error() const noexcept
+{
+  auto terminal = _ctx->gate().terminal_error();
+  return terminal != nullptr ? terminal : state().stopped;
+}
+
+s3rdma_reactor::dispatch_scope::dispatch_scope(admission_gate::admission_permit permit,
+                                               s3rdma_reactor* owner) noexcept
+  : _permit(std::move(permit)), _owner(owner)
+{
+}
+
+s3rdma_reactor::dispatch_scope::dispatch_scope(dispatch_scope&& other) noexcept
+  : _permit(std::move(other._permit)), _owner(std::exchange(other._owner, nullptr))
+{
+}
+
+s3rdma_reactor::dispatch_scope::~dispatch_scope()
+{
+  if (_owner != nullptr) { _owner->state().calls.leave(); }
+}
+
+/**
+ * The permit makes closing wait for the dispatch, as for a control call, and
+ * is refused once the backend stopped admitting work.  The dispatch is also
+ * one of the backend's CUDA calls, because the framework asks CUDA for the
+ * current device: it enters like any other and is refused once calls may no
+ * longer start.
+ */
+std::optional<s3rdma_reactor::dispatch_scope> s3rdma_reactor::admit_dispatch(
+  std::exception_ptr& refusal) noexcept
+{
+  refusal = admission_error();
+  if (refusal != nullptr) { return std::nullopt; }
+  try {
+    auto permit = _ctx->gate().acquire_control();
+    if (state().calls.try_enter(backend_call::dispatch)) {
+      return dispatch_scope{std::move(permit), this};
+    }
+    refusal = stop_error();
+  } catch (...) {
+    refusal = std::current_exception();
+  }
+  return std::nullopt;
 }
 
 //===----------------------------------------------------------------------===//
@@ -736,6 +904,8 @@ void s3rdma_reactor::worker_main(std::size_t index) noexcept
   rdma_data_session* session = nullptr;
   std::exception_ptr failure;
   try {
+    auto const entered = shared.calls.enter(backend_call::session_acquire);
+    if (!entered) { std::rethrow_exception(stop_error()); }
     auto acquired = _ctx->clients().data_sessions->acquire();
     if (acquired == nullptr) {
       throw error{errc::backend_unavailable,
@@ -787,25 +957,17 @@ void s3rdma_reactor::process(std::size_t index,
     shared.error_total.fetch_add(1, std::memory_order_relaxed);
     claimed.report_error(std::move(failure));
   };
-  auto const stop_error = [&]() noexcept {
-    auto terminal = gate.terminal_error();
-    return terminal != nullptr ? terminal : shared.stopped;
-  };
-  // No call may start once CUDA and the transport are off limits; one that was
-  // already entered still returns.
-  auto const halted = [&]() noexcept {
-    if (!shared.halted()) { return false; }
-    fail(stop_error());
-    return true;
-  };
-  // A CUDA call made before the GET.
-  auto const prepared = [&](cudaError_t rc, char const* what) noexcept {
+  // The outcome of a CUDA call made before the copy.  False when the chunk was
+  // failed for it: the call may no longer start, or it reported an error.
+  auto const prepared = [&](std::optional<cudaError_t> rc, char const* what) noexcept {
     if (rc == cudaSuccess) { return true; }
-    if (is_context_fatal(rc)) {
-      context_fatal(chunk.device_id, rc, what);
+    if (!rc.has_value()) {
+      fail(stop_error());
+    } else if (is_context_fatal(*rc)) {
+      context_fatal(chunk.device_id, *rc, what);
       fail(stop_error());
     } else {
-      fail(cuda_failure(what, rc, shared.device));
+      fail(cuda_failure(what, *rc, shared.device));
     }
     return false;
   };
@@ -821,18 +983,19 @@ void s3rdma_reactor::process(std::size_t index,
   // the arena of max_inflight x arena_slot_size bytes.
   auto const landing = index * cfg.arena_slot_size;
 
-  if (halted()) { return; }
   if (current_device != chunk.device_id) {
-    if (!prepared(guarded([&] { return ops.set_device(chunk.device_id); }), "cudaSetDevice")) {
+    if (!prepared(
+          shared.cuda(backend_call::set_device, [&] { return ops.set_device(chunk.device_id); }),
+          "cudaSetDevice")) {
       return;
     }
     current_device = chunk.device_id;
   }
 
   // A capturing stream would record the copy instead of running it.
-  if (halted()) { return; }
   auto capture = cudaStreamCaptureStatusNone;
-  if (!prepared(guarded([&] { return ops.stream_capture_query(chunk.stream.get(), &capture); }),
+  if (!prepared(shared.cuda(backend_call::stream_capture_query,
+                            [&] { return ops.stream_capture_query(chunk.stream.get(), &capture); }),
                 "cudaStreamIsCapturing")) {
     return;
   }
@@ -841,35 +1004,54 @@ void s3rdma_reactor::process(std::size_t index,
     return;
   }
 
-  if (halted()) { return; }
   cudaEvent_t event = nullptr;
-  if (!prepared(guarded([&] { return ops.event_create(&event, cudaEventDisableTiming); }),
+  if (!prepared(shared.cuda(backend_call::event_create,
+                            [&] { return ops.event_create(&event, cudaEventDisableTiming); }),
                 "cudaEventCreateWithFlags")) {
     return;
   }
-  auto const drop_event = [&]() noexcept {
-    if (!shared.halted()) { detail::destroy_event(ops, event); }
+  // The chunk ends before its copy started, for the reason @p cause.  Its
+  // event is destroyed first, and that is one more CUDA call made before the
+  // copy: an error that leaves the context unusable stops the backend, any
+  // other is recorded and changes nothing.  Once the backend stopped, the
+  // chunk reports what it stopped with.
+  auto const abandon = [&](std::exception_ptr cause) noexcept {
+    auto const rc =
+      shared.cuda(backend_call::event_destroy, [&] { return ops.event_destroy(event); });
+    if (rc.has_value() && *rc != cudaSuccess) {
+      if (is_context_fatal(*rc)) {
+        context_fatal(chunk.device_id, *rc, "cudaEventDestroy");
+      } else {
+        log_ignored("a CUDA event could not be destroyed", *rc);
+      }
+    }
+    fail(shared.calls.stopped() ? stop_error() : std::move(cause));
   };
 
-  if (halted()) { return; }
   try {
     gate.acquire_get(claimed);
   } catch (...) {
-    auto refusal = std::current_exception();
-    drop_event();
-    fail(std::move(refusal));
+    abandon(std::current_exception());
     return;
   }
-  if (halted()) { return; }
 
   std::optional<peak_scope> slot;
-  slot.emplace(shared.slots_in_use, shared.slots_in_use_peak);
   data_get_result result;
   bool threw = false;
-  try {
-    result = session.get(object->ref(), chunk.object_offset, chunk.size, block->base, landing);
-  } catch (...) {
-    threw = true;
+  {
+    // The permit alone does not start the GET: like every call it has to
+    // enter, and it may not once calls stopped.
+    auto const entered = shared.calls.enter(backend_call::data_get);
+    if (!entered) {
+      fail(stop_error());
+      return;
+    }
+    slot.emplace(shared.slots_in_use, shared.slots_in_use_peak);
+    try {
+      result = session.get(object->ref(), chunk.object_offset, chunk.size, block->base, landing);
+    } catch (...) {
+      threw = true;
+    }
   }
   if (threw || !delivered(result, chunk.size, _ctx->clients().rule)) {
     // The transfer may still write to the slot, so nothing can be reused.
@@ -880,41 +1062,52 @@ void s3rdma_reactor::process(std::size_t index,
     auto fatal = get_failure(threw, result, chunk.size, shared.transport);
     fail_closed(fatal);
     log_stop("the backend stopped after a data-plane failure and keeps its landing memory", fatal);
-    drop_event();
-    fail(stop_error());
+    abandon(stop_error());
     return;
   }
 
   // The bytes arrived, but the backend stopped meanwhile: nothing more is
   // delivered from it.
-  if (auto stop = shared.halted() ? stop_error() : gate.terminal_error(); stop != nullptr) {
-    drop_event();
-    fail(std::move(stop));
+  if (auto stop = gate.terminal_error(); stop != nullptr) {
+    abandon(std::move(stop));
     return;
   }
 
   if (block->flush_required) {
-    auto const rc = guarded([&] { return ops.flush(); });
-    if (rc != cudaSuccess) {
-      if (is_context_fatal(rc)) {
-        context_fatal(chunk.device_id, rc, "cudaDeviceFlushGPUDirectRDMAWrites");
+    auto const rc = shared.cuda(backend_call::flush, [&] { return ops.flush(); });
+    if (!rc.has_value()) {
+      fail(stop_error());
+      return;
+    }
+    if (*rc != cudaSuccess) {
+      if (is_context_fatal(*rc)) {
+        context_fatal(chunk.device_id, *rc, "cudaDeviceFlushGPUDirectRDMAWrites");
         fail(stop_error());
       } else {
         // The transfer completed and no copy was started: the slot is idle.
-        drop_event();
-        fail(cuda_failure("cudaDeviceFlushGPUDirectRDMAWrites", rc, shared.device));
+        abandon(cuda_failure("cudaDeviceFlushGPUDirectRDMAWrites", *rc, shared.device));
       }
       return;
     }
     shared.flush_total.fetch_add(1, std::memory_order_relaxed);
-    if (halted()) { return; }
   }
 
-  // From here the chunk either completes or the process ends.
-  detail::copy_out(
-    ops, chunk.device_dst, block->base + landing, chunk.size, chunk.stream.get(), event);
+  {
+    // The copy is the last call that has to enter.  Once it has, the chunk
+    // either completes or the process ends, whatever stops the backend
+    // meanwhile.
+    auto const entered = shared.calls.enter(backend_call::memcpy_async);
+    if (!entered) {
+      fail(stop_error());
+      return;
+    }
+    detail::copy_out(
+      ops, chunk.device_dst, block->base + landing, chunk.size, chunk.stream.get(), event);
+  }
   slot.reset();
-  drop_event();
+  if (auto const entered = shared.calls.enter(backend_call::event_destroy)) {
+    detail::destroy_event(ops, event);
+  }
   shared.bytes_total.fetch_add(chunk.size, std::memory_order_relaxed);
   claimed.complete();
 }
@@ -960,8 +1153,10 @@ std::size_t s3rdma_reactor::host_read(io_object_type const& object,
     range_get_result result;
     {
       // One permit per attempt: a close between two attempts ends the read.
-      auto const permit = gate.acquire_control();
-      result            = control.range_get(object.ref(), offset, size, destination);
+      auto const permit  = gate.acquire_control();
+      auto const entered = state().calls.enter(backend_call::control_range_get);
+      if (!entered) { std::rethrow_exception(stop_error()); }
+      result = control.range_get(object.ref(), offset, size, destination);
     }
     auto const status = result.outcome.http_status;
     auto const reject = [&](char const* why) {
@@ -1012,8 +1207,10 @@ std::shared_ptr<io_object> s3rdma_reactor::open(std::string path)
   object_ref ref{std::move(parsed.host), std::move(parsed.path)};
   head_result result;
   {
-    auto const permit = _ctx->gate().acquire_control();
-    result            = _ctx->clients().control->head(ref);
+    auto const permit  = _ctx->gate().acquire_control();
+    auto const entered = state().calls.enter(backend_call::control_head);
+    if (!entered) { std::rethrow_exception(stop_error()); }
+    result = _ctx->clients().control->head(ref);
   }
   if (!result.outcome.transport_ok() || result.outcome.http_status != 200) {
     throw error{errc::control_failed,
