@@ -120,6 +120,41 @@ class request_authorizer {
                                                      std::chrono::seconds timeout) = 0;
 
   /**
+   * @brief Authorize a request whose authorization must also cover additional
+   *        request headers.
+   *
+   * For a header that is part of what the store authorizes — a byte range
+   * that must not change in transit, a one-time token — and so has to be
+   * signed rather than appended to an already authorized request.
+   *
+   * @param signed_headers  Headers the request will carry and the
+   *                         authorization must cover: name and value as sent.
+   *                         Must not repeat a name or name a header the
+   *                         authorizer adds itself.
+   * @return The URL plus every header to attach verbatim, @p signed_headers
+   *         included.
+   *
+   * Default: with no additional header this is @ref authorize; with any it
+   * throws. An authorizer that cannot bind a header into its authorization —
+   * a query-signing one covers the @c host header only — must not hand back a
+   * request that merely carries it.
+   *
+   * @throw cucascade::io::credential_error when unsupported, for a header that
+   *        cannot be signed, or on signing failure. The message never contains
+   *        a header value.
+   */
+  [[nodiscard]] virtual authorized_request authorize_with_headers(
+    object_ref const& obj,
+    request_method method,
+    std::vector<std::pair<std::string, std::string>> const& signed_headers,
+    std::chrono::seconds timeout)
+  {
+    if (signed_headers.empty()) { return authorize(obj, method, timeout); }
+    throw cucascade::io::credential_error(
+      "request_authorizer: this authorizer cannot sign additional request headers");
+  }
+
+  /**
    * @brief Authorize a bucket-level ListObjectsV2 GET.
    *
    * @param bucket           Bucket name (no scheme / slashes).

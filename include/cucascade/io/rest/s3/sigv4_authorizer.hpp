@@ -116,6 +116,20 @@ class sigv4_header_authorizer final : public sigv4_authorizer_base {
                                request_method method,
                                std::chrono::seconds timeout) override;
 
+  /// As @ref authorize, with @p signed_headers inside the signature and in the
+  /// returned headers. A value keeps its meaning only if it survives SigV4
+  /// canonicalization unchanged, so control characters and runs of spaces are
+  /// rejected.
+  /// @throw cucascade::io::credential_error on empty bucket / key, on a header
+  ///        name that is empty, malformed, repeated or one of @c host,
+  ///        @c x-amz-date, @c x-amz-content-sha256, @c x-amz-security-token and
+  ///        @c authorization, on such a value, or on SigV4 failure.
+  authorized_request authorize_with_headers(
+    object_ref const& obj,
+    request_method method,
+    std::vector<std::pair<std::string, std::string>> const& signed_headers,
+    std::chrono::seconds timeout) override;
+
   /// Header-signed bucket-level ListObjectsV2: returns a plain
   /// @c "{scheme}://{host}/{bucket}?{canonical_query}" URL plus the signed
   /// Authorization / x-amz-* headers. @c timeout is unused (header auth carries

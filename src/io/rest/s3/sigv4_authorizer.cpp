@@ -21,10 +21,14 @@
 #include <cucascade/io/rest/s3/sigv4_authorizer.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <ctime>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 namespace cucascade::io::rest::s3 {
 
@@ -143,6 +147,40 @@ void reject_amz_query_params(std::string_view canonical_query)
   }
 }
 
+// Headers a caller asks to have signed. A name the signer adds itself would be
+// signed twice; a control character could end the header line; a run of spaces
+// is collapsed by the verifier but not by sign_request. Messages name the
+// header and never its value, which may be a secret.
+void check_signed_headers(std::vector<std::pair<std::string, std::string>> const& headers)
+{
+  constexpr std::array<std::string_view, 5> reserved{
+    "host", "x-amz-date", "x-amz-content-sha256", "x-amz-security-token", "authorization"};
+  std::vector<std::string> seen;
+  seen.reserve(headers.size());
+  for (auto const& [name, value] : headers) {
+    auto const lowered = to_lower(name);
+    bool const token = !lowered.empty() && std::all_of(lowered.begin(), lowered.end(), [](char c) {
+      return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '-' || c == '_';
+    });
+    if (!token) {
+      throw credential_error("sigv4_header_authorizer: malformed name of a header to sign");
+    }
+    if (std::find(reserved.begin(), reserved.end(), lowered) != reserved.end() ||
+        std::find(seen.begin(), seen.end(), lowered) != seen.end()) {
+      throw credential_error("sigv4_header_authorizer: header '" + lowered +
+                             "' is added by the signer or was given twice");
+    }
+    bool const plain = std::none_of(value.begin(), value.end(), [](char c) {
+      return static_cast<unsigned char>(c) < 0x20 || c == 0x7f;
+    });
+    if (!plain || value.find("  ") != std::string::npos) {
+      throw credential_error("sigv4_header_authorizer: the value of header '" + lowered +
+                             "' cannot be signed as given");
+    }
+    seen.push_back(lowered);
+  }
+}
+
 }  // namespace
 
 sigv4_authorizer_base::sigv4_authorizer_base(static_credentials creds,
@@ -240,21 +278,31 @@ sigv4_header_authorizer::sigv4_header_authorizer(static_credentials creds,
 
 authorized_request sigv4_header_authorizer::authorize(object_ref const& obj,
                                                       request_method method,
-                                                      std::chrono::seconds /*timeout*/)
+                                                      std::chrono::seconds timeout)
 {
+  // Any Range is added unsigned by the caller, so no extra header is signed.
+  return authorize_with_headers(obj, method, {}, timeout);
+}
+
+authorized_request sigv4_header_authorizer::authorize_with_headers(
+  object_ref const& obj,
+  request_method method,
+  std::vector<std::pair<std::string, std::string>> const& signed_headers,
+  std::chrono::seconds /*timeout*/)
+{
+  check_signed_headers(signed_headers);
   auto const canonical_uri = make_canonical_uri(obj);
   auto const signer        = make_signer(_creds, _region);
 
   try {
-    // Auth in the Authorization header. GET/HEAD have no body, and any Range is
-    // added unsigned by the caller, so the canonical query and extra signed
-    // headers are empty and the payload hash is sha256("").
+    // Auth in the Authorization header. GET/HEAD have no body, so the canonical
+    // query is empty and the payload hash is sha256("").
     auto signed_req = sign_request(method_to_str(method),
                                    _host,
                                    canonical_uri,
                                    /*canonical_query=*/"",
                                    sha256_hex(""),
-                                   /*extra_headers=*/{},
+                                   signed_headers,
                                    signer,
                                    std::time(nullptr));
     std::string url = _scheme + "://" + _host + canonical_uri;
