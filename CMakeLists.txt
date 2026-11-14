@@ -45,6 +45,11 @@ option(
   OFF)
 
 option(
+  CUCASCADE_BUILD_CUOBJ_SHIM
+  "Build the library that binds the S3-over-RDMA component to the cuObject client (requires the cuObject SDK)"
+  OFF)
+
+option(
   CUCASCADE_BUILD_S3_BENCHMARK
   "Build the S3 parquet benchmark (requires aws-sdk-cpp; NOT a cuCascade dependency)"
   OFF)
@@ -152,6 +157,19 @@ if(CUCASCADE_BUILD_S3_RDMA AND NOT CUCASCADE_BUILD_IO)
   # A parent project may have set the option as a normal variable, which the
   # cache write above does not replace.
   set(CUCASCADE_BUILD_S3_RDMA OFF)
+endif()
+
+# The cuObject binding is built with the component it serves.
+if(CUCASCADE_BUILD_CUOBJ_SHIM AND NOT CUCASCADE_BUILD_S3_RDMA)
+  message(
+    STATUS
+      "CUCASCADE_BUILD_CUOBJ_SHIM disabled: requires CUCASCADE_BUILD_S3_RDMA=ON"
+  )
+  set(CUCASCADE_BUILD_CUOBJ_SHIM
+      OFF
+      CACHE BOOL "Build the cuObject binding of the S3-over-RDMA component"
+            FORCE)
+  set(CUCASCADE_BUILD_CUOBJ_SHIM OFF)
 endif()
 
 # The S3 benchmark needs the io library (rest backend) and the benchmark tree.

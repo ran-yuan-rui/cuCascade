@@ -28,3 +28,8 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/errors.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/s3rdma_ioctx.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/s3rdma_reactor.cpp)
+
+# The only unit that needs the cuObject SDK; nothing above depends on it.
+if(CUCASCADE_BUILD_CUOBJ_SHIM)
+  add_subdirectory(cuobj_shim)
+endif()
