@@ -503,8 +503,9 @@ endif()
 
 if(CUCASCADE_BUILD_S3_RDMA)
   # The component inherits the io usage requirements by linking the io object
-  # library; it adds no dependency of its own.
-  target_link_libraries(cucascade_io_s3rdma_objects PUBLIC cucascade_io_objects)
+  # library; of its own it adds only the system's dynamic loader.
+  target_link_libraries(cucascade_io_s3rdma_objects PUBLIC cucascade_io_objects
+                                                           ${CMAKE_DL_LIBS})
   target_include_directories(cucascade_io_s3rdma_objects
                              PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
   target_compile_features(cucascade_io_s3rdma_objects PUBLIC cxx_std_20)
@@ -628,7 +629,7 @@ if(CUCASCADE_BUILD_STATIC_LIBS)
       target_include_directories(cucascade_io_s3rdma_static
                                  PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
       target_link_libraries(cucascade_io_s3rdma_static
-                            PUBLIC cucascade_io_static)
+                            PUBLIC cucascade_io_static ${CMAKE_DL_LIBS})
       target_compile_features(cucascade_io_s3rdma_static PUBLIC cxx_std_20)
       # Lets a consumer guard its use of the component.
       target_compile_definitions(cucascade_io_s3rdma_static
@@ -729,7 +730,7 @@ if(CUCASCADE_BUILD_SHARED_LIBS)
       target_include_directories(cucascade_io_s3rdma_shared
                                  PUBLIC ${CUCASCADE_PUBLIC_INCLUDE_DIRS})
       target_link_libraries(cucascade_io_s3rdma_shared
-                            PUBLIC cucascade_io_shared)
+                            PUBLIC cucascade_io_shared ${CMAKE_DL_LIBS})
       target_compile_features(cucascade_io_s3rdma_shared PUBLIC cxx_std_20)
       # Lets a consumer guard its use of the component.
       target_compile_definitions(cucascade_io_s3rdma_shared

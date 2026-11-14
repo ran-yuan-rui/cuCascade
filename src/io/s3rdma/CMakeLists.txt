@@ -23,6 +23,7 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/config.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/control_client.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cuda_delivery.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/data_plane.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/delivery_boundary.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/errors.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/s3rdma_ioctx.cpp
