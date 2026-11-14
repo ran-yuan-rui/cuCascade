@@ -43,6 +43,9 @@ config sanitized(config cfg)
   if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) {
     throw std::invalid_argument("s3rdma: a device id is listed twice");
   }
+  if (cfg.list_max_matches == 0 || cfg.list_max_scanned == 0) {
+    throw std::invalid_argument("s3rdma: the listing caps must be positive");
+  }
 
   constexpr auto max_size = std::numeric_limits<std::size_t>::max();
   if (cfg.max_inflight > max_size / cfg.arena_slot_size) {

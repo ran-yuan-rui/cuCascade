@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include <cucascade/io/rest/s3/list_parser.hpp>
+
 #include <cstddef>
 #include <optional>
 #include <vector>
@@ -53,6 +55,12 @@ struct config {
   /// duplicate.
   std::vector<int> devices{};
 
+  /// Caps of a listing, as for the REST backend: objects a whole listing may
+  /// return, and objects a listing may look at across its pages.  Exceeding
+  /// either fails the listing; neither truncates it.
+  std::size_t list_max_matches{rest::s3::default_max_list_objects};
+  std::size_t list_max_scanned{rest::s3::default_max_scanned_objects};
+
   /// An object store addresses single bytes.
   [[nodiscard]] std::size_t min_alignment_requirement() const noexcept { return 1; }
 
@@ -67,8 +75,8 @@ struct config {
  *
  * @return @p cfg with @c queue_cap set.
  * @throws std::invalid_argument @c max_inflight is zero, @c arena_slot_size is
- *         zero, @c queue_cap is set to zero, or @c devices is empty or holds a
- *         negative or repeated id.
+ *         zero, @c queue_cap is set to zero, @c devices is empty or holds a
+ *         negative or repeated id, or a listing cap is zero.
  * @throws std::overflow_error @c max_inflight x @c arena_slot_size overflows,
  *         or @c queue_cap is unset and 4 x @c max_inflight overflows (checked
  *         in that order).

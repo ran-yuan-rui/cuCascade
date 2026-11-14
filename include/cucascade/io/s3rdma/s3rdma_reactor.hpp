@@ -43,21 +43,42 @@ namespace cucascade::io::s3rdma {
 
 /**
  * @brief An S3 object as the S3-over-RDMA backend addresses it.
+ *
+ * An object opened with a strong validator is read on the condition that it
+ * still carries it, on both planes, and two opens with the same validator and
+ * size share an identity.  Without one every open has an identity of its own
+ * and reads are unconditional.
  */
 class s3rdma_io_object final : public io_object {
  public:
   /// @param size Size of the object in bytes, as established by the caller.
-  s3rdma_io_object(std::string path, object_ref ref, std::size_t size);
+  /// @param validation_tag The @c ETag the object carried when it was opened,
+  ///        as received; empty when it carried none.
+  s3rdma_io_object(std::string path,
+                   object_ref ref,
+                   std::size_t size,
+                   std::string validation_tag = {});
 
   [[nodiscard]] object_ref const& ref() const noexcept { return _ref; }
   [[nodiscard]] std::string const& raw_file_cache_id() const noexcept override { return _path; }
   [[nodiscard]] std::string const& object_path() const noexcept override { return _path; }
   [[nodiscard]] std::size_t size() const noexcept override { return _size; }
+  [[nodiscard]] std::string_view validation_tag() const noexcept override { return _tag; }
+  [[nodiscard]] bool validation_tag_is_strong() const noexcept override { return _strong; }
+
+  /// The validator reads of this object are conditioned on; empty when the
+  /// object was opened without a strong one.
+  [[nodiscard]] std::string_view condition() const noexcept
+  {
+    return _strong ? std::string_view{_tag} : std::string_view{};
+  }
 
  private:
   std::string _path;
   object_ref _ref;
   std::size_t _size;
+  std::string _tag;
+  bool _strong;
 };
 
 /**
@@ -131,9 +152,12 @@ class runtime_status {
  *
  * A GET that does not complete exactly stops the backend: nothing further is
  * admitted and the landing memory is kept, because a transfer of unknown
- * outcome may still write to it.  A CUDA error that leaves the context
- * unusable stops it the same way and additionally ends every CUDA and
- * transport call of the backend; see @ref context_health_policy.
+ * outcome may still write to it.  That includes a GET for an object opened
+ * with a strong validator whose response is refused for it or names another
+ * version: on this plane a changed object is not an ordinary error.  A CUDA
+ * error that leaves the context unusable stops the backend the same way and
+ * additionally ends every CUDA and transport call of the backend; see
+ * @ref context_health_policy.
  *
  * Host reads and object open go through the control client on the calling
  * thread.
@@ -195,6 +219,9 @@ class s3rdma_reactor {
 
   [[nodiscard]] config const& get_config() const noexcept { return _ctx->cfg(); }
 
+  /// How the deployment's two endpoints relate, as its clients were built.
+  [[nodiscard]] endpoint_topology topology() const noexcept { return _ctx->clients().topology; }
+
   /**
    * @brief Allocate and register the landing arenas and start the workers.
    *
@@ -248,8 +275,13 @@ class s3rdma_reactor {
    * transport error, a 5xx status or a short body; any other failure ends the
    * read at once.
    *
+   * An object opened with a strong validator is read on the condition that
+   * it still carries it.
+   *
    * @return Bytes read; zero for an empty or out-of-object range.
    * @throws std::invalid_argument @p destination is null for a non-empty read.
+   * @throws object_changed_error the condition was refused, or a complete
+   *         response does not carry the validator; not retried.
    * @throws std::exception the read failed, or the backend is stopped or not
    *         started.
    */
@@ -318,6 +350,8 @@ class s3rdma_reactor {
   /// value, with @p refusal set, when it may not.
   [[nodiscard]] std::optional<dispatch_scope> admit_dispatch(std::exception_ptr& refusal) noexcept;
   [[nodiscard]] std::shared_ptr<io_object> open(std::string path);
+  /// The body of one ListObjectsV2 page: one request, never repeated.
+  [[nodiscard]] std::string list_page(std::string_view bucket, std::string_view canonical_query);
   void check_device_health() noexcept;
 
   std::shared_ptr<reactor_context> _ctx;

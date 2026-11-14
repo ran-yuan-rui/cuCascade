@@ -74,7 +74,14 @@ s3rdma_ioctx::s3rdma_ioctx(config cfg,
   : templated_ioctx<s3rdma_reactor>(
       make_reactors(std::move(cfg), std::move(clients), std::move(delivery), std::move(policy))),
     _unsupported(std::make_exception_ptr(
-      error{errc::unsupported_request, "s3rdma: only device-memory destinations are supported"}))
+      error{errc::unsupported_request, "s3rdma: only device-memory destinations are supported"})),
+    _lister(
+      [this](std::string_view bucket, std::string_view /*prefix*/, std::string_view query) {
+        return reactor().list_page(bucket, query);
+      },
+      reactor().get_config().list_max_scanned,
+      reactor().get_config().list_max_matches,
+      "s3rdma_ioctx::list_objects")
 {
 }
 
@@ -156,6 +163,26 @@ exec::semi_future<std::size_t> s3rdma_ioctx::host_readv_async_io(io_object const
     return exec::make_semi_future<std::size_t>(std::current_exception());
   }
 }
+
+void s3rdma_ioctx::list_objects_paged(
+  std::string_view bucket,
+  std::string_view prefix,
+  std::size_t page_size,
+  std::function<bool(rest::s3::list_objects_v2_page const&)> const& sink,
+  std::optional<std::size_t> max_scanned)
+{
+  _lister.list_objects_paged(bucket, prefix, page_size, sink, max_scanned);
+}
+
+std::vector<rest::s3::list_entry> s3rdma_ioctx::list_objects(std::string_view bucket,
+                                                             std::string_view prefix,
+                                                             std::size_t page_size,
+                                                             std::optional<std::size_t> max_keys)
+{
+  return _lister.list_objects(bucket, prefix, page_size, max_keys);
+}
+
+std::size_t s3rdma_ioctx::list_max_matches() const noexcept { return _lister.list_max_matches(); }
 
 std::vector<s3rdma_reactor*> s3rdma_ioctx::next_reactor(io_object_type const& /*object*/,
                                                         std::size_t /*n_slices*/,

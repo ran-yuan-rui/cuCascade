@@ -20,6 +20,7 @@
 #include "call_admission.hpp"
 #include "delivery_boundary.hpp"
 
+#include <cucascade/io/io_errors.hpp>
 #include <cucascade/io/io_utils.hpp>
 #include <cucascade/io/s3rdma/errors.hpp>
 #include <cucascade/io/s3rdma/s3rdma_reactor.hpp>
@@ -234,6 +235,7 @@ char const* name_of(data_commit_state commit) noexcept
 std::exception_ptr get_failure(bool threw,
                                data_get_result const& result,
                                std::size_t expected,
+                               std::string_view condition,
                                std::exception_ptr const& fallback) noexcept
 {
   try {
@@ -249,16 +251,22 @@ std::exception_ptr get_failure(bool threw,
               std::to_string(result.delivered_bytes) + " of " + std::to_string(expected) +
               " bytes reported, transfer call returned " + std::to_string(result.sdk_return) +
               (result.transport_error.empty() ? "" : ", transport error reported") +
-              (result.reply_tag.empty() ? ", no reply header" : "") + ")"});
+              (result.reply_tag.empty() ? ", no reply header" : "") +
+              (condition.empty() || result.validation_tag == condition
+                 ? ""
+                 : ", the response does not carry the validator the object was opened with") +
+              ")"});
   } catch (...) {
     return fallback;
   }
 }
 
-/// True when @p result is a complete transfer of exactly @p expected bytes.
+/// True when @p result is a complete transfer of exactly @p expected bytes of
+/// the object version @p condition names (empty: the GET was unconditional).
 /// Every condition is necessary; none is sufficient.
 bool delivered(data_get_result const& result,
                std::size_t expected,
+               std::string_view condition,
                completion_rule const& rule) noexcept
 {
   if (result.commit != data_commit_state::completed || !result.transport_error.empty()) {
@@ -269,6 +277,14 @@ bool delivered(data_get_result const& result,
     return false;
   }
   if (result.reply_tag.empty()) { return false; }
+  if (!condition.empty()) {
+    // A response without a validator passes only where the rule allows it; one
+    // with another validator is another version of the object.
+    if (result.validation_tag.empty() ? rule.require_validator_echo
+                                      : result.validation_tag != condition) {
+      return false;
+    }
+  }
   if (std::find(rule.accepted_statuses.begin(), rule.accepted_statuses.end(), result.http_status) ==
       rule.accepted_statuses.end()) {
     return false;
@@ -489,8 +505,15 @@ std::optional<std::size_t> content_range_start(std::string_view value) noexcept
 // Object and context
 //===----------------------------------------------------------------------===//
 
-s3rdma_io_object::s3rdma_io_object(std::string path, object_ref ref, std::size_t size)
-  : _path(std::move(path)), _ref(std::move(ref)), _size(size)
+s3rdma_io_object::s3rdma_io_object(std::string path,
+                                   object_ref ref,
+                                   std::size_t size,
+                                   std::string validation_tag)
+  : _path(std::move(path)),
+    _ref(std::move(ref)),
+    _size(size),
+    _tag(std::move(validation_tag)),
+    _strong(is_strong_validator(_tag))
 {
 }
 
@@ -982,7 +1005,8 @@ void s3rdma_reactor::process(std::size_t index,
   }
   // index < max_inflight and size <= arena_slot_size keep the transfer inside
   // the arena of max_inflight x arena_slot_size bytes.
-  auto const landing = index * cfg.arena_slot_size;
+  auto const landing   = index * cfg.arena_slot_size;
+  auto const condition = object->condition();
 
   if (current_device != chunk.device_id) {
     if (!prepared(
@@ -1049,18 +1073,22 @@ void s3rdma_reactor::process(std::size_t index,
     }
     slot.emplace(shared.slots_in_use, shared.slots_in_use_peak);
     try {
-      result = session.get(object->ref(), chunk.object_offset, chunk.size, block->base, landing);
+      result =
+        condition.empty()
+          ? session.get(object->ref(), chunk.object_offset, chunk.size, block->base, landing)
+          : session.get_if_match(
+              object->ref(), chunk.object_offset, chunk.size, block->base, landing, condition);
     } catch (...) {
       threw = true;
     }
   }
-  if (threw || !delivered(result, chunk.size, _ctx->clients().rule)) {
+  if (threw || !delivered(result, chunk.size, condition, _ctx->clients().rule)) {
     // The transfer may still write to the slot, so nothing can be reused.
     if (!threw && result.commit == data_commit_state::completed &&
         result.delivered_bytes < chunk.size) {
       shared.short_read_total.fetch_add(1, std::memory_order_relaxed);
     }
-    auto fatal = get_failure(threw, result, chunk.size, shared.transport);
+    auto fatal = get_failure(threw, result, chunk.size, condition, shared.transport);
     fail_closed(fatal);
     log_stop("the backend stopped after a data-plane failure and keeps its landing memory", fatal);
     abandon(stop_error());
@@ -1149,6 +1177,7 @@ std::size_t s3rdma_reactor::host_read(io_object_type const& object,
   auto& gate           = _ctx->gate();
   auto& control        = *_ctx->clients().control;
   bool const whole     = offset == 0 && size == object.size();
+  auto const condition = object.condition();
   char const* last_try = "";
   for (int attempt = 1;; ++attempt) {
     range_get_result result;
@@ -1157,7 +1186,9 @@ std::size_t s3rdma_reactor::host_read(io_object_type const& object,
       auto const permit  = gate.acquire_control();
       auto const entered = state().calls.enter(backend_call::control_range_get);
       if (!entered) { std::rethrow_exception(stop_error()); }
-      result = control.range_get(object.ref(), offset, size, destination);
+      result = condition.empty()
+                 ? control.range_get(object.ref(), offset, size, destination)
+                 : control.range_get_if_match(object.ref(), offset, size, destination, condition);
     }
     auto const status = result.outcome.http_status;
     auto const reject = [&](char const* why) {
@@ -1165,6 +1196,19 @@ std::size_t s3rdma_reactor::host_read(io_object_type const& object,
                   std::string{"s3rdma: host read failed: "} + why + " (HTTP status " +
                     std::to_string(status) + ")"};
     };
+    // The bytes of a complete response count only when it names the version
+    // of the object that was opened.
+    auto const same_version = [&] {
+      if (!condition.empty() && result.validation_tag != condition) {
+        throw object_changed_error(
+          object.object_path(), std::string{condition}, result.validation_tag);
+      }
+    };
+    // The status alone decides: the condition was refused, however the
+    // response ended.
+    if (status == 412 && !condition.empty()) {
+      throw object_changed_error(object.object_path(), std::string{condition}, {});
+    }
     if (status >= 400 && status < 500) {
       reject(status == 416 ? "the server reports the range as outside the object"
                            : "the request was refused");
@@ -1178,12 +1222,18 @@ std::size_t s3rdma_reactor::host_read(io_object_type const& object,
       if (!first.has_value() || *first != offset) {
         reject("the response does not identify the requested range");
       }
-      if (result.delivered_bytes == size) { return size; }
+      if (result.delivered_bytes == size) {
+        same_version();
+        return size;
+      }
       if (result.delivered_bytes > size) { reject("the response is longer than the range"); }
       last_try = "short response";
     } else if (status == 200) {
       if (!whole) { reject("the server returned the whole object for a range request"); }
-      if (result.delivered_bytes == size) { return size; }
+      if (result.delivered_bytes == size) {
+        same_version();
+        return size;
+      }
       if (result.delivered_bytes > size) { reject("the response is longer than the object"); }
       last_try = "short response";
     } else {
@@ -1219,7 +1269,27 @@ std::shared_ptr<io_object> s3rdma_reactor::open(std::string path)
                   (result.outcome.transport_ok() ? "" : "transport error, ") + "HTTP status " +
                   std::to_string(result.outcome.http_status) + ")"};
   }
-  return std::make_shared<s3rdma_io_object>(std::move(path), std::move(ref), result.object_size);
+  return std::make_shared<s3rdma_io_object>(
+    std::move(path), std::move(ref), result.object_size, std::move(result.validation_tag));
+}
+
+std::string s3rdma_reactor::list_page(std::string_view bucket, std::string_view canonical_query)
+{
+  if (auto refusal = admission_error()) { std::rethrow_exception(refusal); }
+  list_page_result result;
+  {
+    auto const permit  = _ctx->gate().acquire_control();
+    auto const entered = state().calls.enter(backend_call::control_list);
+    if (!entered) { std::rethrow_exception(stop_error()); }
+    result = _ctx->clients().control->list_page(bucket, canonical_query);
+  }
+  if (!result.outcome.transport_ok() || result.outcome.http_status != 200) {
+    throw error{errc::control_failed,
+                std::string{"s3rdma: the bucket could not be listed ("} +
+                  (result.outcome.transport_ok() ? "" : "transport error, ") + "HTTP status " +
+                  std::to_string(result.outcome.http_status) + ")"};
+  }
+  return std::move(result.body);
 }
 
 perf_snapshot s3rdma_reactor::perf() const noexcept

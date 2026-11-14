@@ -61,6 +61,7 @@ enum class backend_call : std::uint8_t {
   data_get,
   control_head,
   control_range_get,
+  control_list,
   /// The framework's preparation of a device request, which asks CUDA for the
   /// current device.
   dispatch,

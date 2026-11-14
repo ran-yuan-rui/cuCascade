@@ -21,6 +21,7 @@
 #include <cucascade/exec/semi_future.hpp>
 #include <cucascade/io/datasource_factory.hpp>
 #include <cucascade/io/io_context.hpp>
+#include <cucascade/io/rest/object_store_lister.hpp>
 #include <cucascade/io/s3rdma/client.hpp>
 #include <cucascade/io/s3rdma/config.hpp>
 #include <cucascade/io/s3rdma/cuda_delivery.hpp>
@@ -31,7 +32,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -74,6 +77,9 @@ class s3rdma_ioctx final : public templated_ioctx<s3rdma_reactor> {
   /// How this backend instance ended; stays readable after the context is gone.
   [[nodiscard]] std::shared_ptr<runtime_status const> status() const noexcept;
 
+  /// How the deployment's two endpoints relate; fixed at construction.
+  [[nodiscard]] endpoint_topology topology() const noexcept { return reactor().topology(); }
+
   /**
    * @brief Backend entry for prepared asynchronous reads.
    *
@@ -103,6 +109,36 @@ class s3rdma_ioctx final : public templated_ioctx<s3rdma_reactor> {
     std::span<slice const> slices,
     io_priority priority = io_priority::automatic) noexcept override;
 
+  /**
+   * @brief Stream the ListObjectsV2 pages of @p bucket under @p prefix to
+   * @p sink, one call per page; @p sink returns false to stop.
+   *
+   * Listing runs on the control plane: one signed request per page, never
+   * repeated, each under the rules of every other control call — refused
+   * before a successful start and once the backend stopped.  Page size,
+   * continuation and the caps are those of @c rest::object_store_lister, as
+   * for the REST backend.
+   *
+   * @throws std::exception a page failed, the listing is malformed or a cap
+   *         was exceeded; a listing is never truncated.
+   */
+  void list_objects_paged(std::string_view bucket,
+                          std::string_view prefix,
+                          std::size_t page_size,
+                          std::function<bool(rest::s3::list_objects_v2_page const&)> const& sink,
+                          std::optional<std::size_t> max_scanned = std::nullopt);
+
+  /// Every object under @p prefix, in listing order; see
+  /// @ref list_objects_paged.
+  [[nodiscard]] std::vector<rest::s3::list_entry> list_objects(
+    std::string_view bucket,
+    std::string_view prefix,
+    std::size_t page_size               = 1000,
+    std::optional<std::size_t> max_keys = std::nullopt);
+
+  /// @c config::list_max_matches.
+  [[nodiscard]] std::size_t list_max_matches() const noexcept;
+
   /// The backend has one reactor, and it serves every request.
   std::vector<s3rdma_reactor*> next_reactor(io_object_type const& object,
                                             std::size_t n_slices,
@@ -125,6 +161,7 @@ class s3rdma_ioctx final : public templated_ioctx<s3rdma_reactor> {
   [[nodiscard]] s3rdma_reactor& reactor() const noexcept { return *_reactors.front(); }
 
   std::exception_ptr _unsupported;
+  rest::object_store_lister _lister;
 };
 
 /// True for `s3://` paths: the scheme check to register the backend with.
