@@ -185,6 +185,74 @@ if(CUCASCADE_BUILD_S3_RDMA)
                         ${CMAKE_CURRENT_SOURCE_DIR}/utils)
   endforeach()
 
+  # Sources of the GPU-free suite that are added when they exist: the HTTP
+  # fixture and the suites of the control client, the data plane, conditional
+  # reads and listing.
+  foreach(
+    source
+    io/s3rdma/http_fixture.cpp io/s3rdma/test_s3rdma_control_client.cpp
+    io/s3rdma/test_s3rdma_data_plane.cpp io/s3rdma/test_s3rdma_conditional.cpp
+    io/s3rdma/test_s3rdma_listing.cpp)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${source})
+      target_sources(cucascade_s3rdma_tests PRIVATE ${source})
+    endif()
+  endforeach()
+
+  # Bindings for the data-plane suite: one module per line of
+  # io/s3rdma/test_binding_variants.txt, each built from
+  # io/s3rdma/test_binding.cpp with S3RDMA_TEST_BINDING_VARIANT_<line> defined.
+  # A module sees only the binding interface header; the suite loads it by path,
+  # and none is installed.
+  set(CUCASCADE_S3RDMA_TEST_BINDING_DIR
+      ${CMAKE_CURRENT_BINARY_DIR}/s3rdma_bindings)
+  target_compile_definitions(
+    cucascade_s3rdma_tests
+    PRIVATE S3RDMA_TEST_BINDING_DIR="${CUCASCADE_S3RDMA_TEST_BINDING_DIR}")
+  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/io/s3rdma/test_binding.cpp
+     AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/io/s3rdma/test_binding_variants.txt)
+    file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/io/s3rdma/test_binding_variants.txt
+         CUCASCADE_S3RDMA_TEST_BINDING_VARIANTS REGEX "^[a-z0-9_]+$")
+    foreach(variant IN LISTS CUCASCADE_S3RDMA_TEST_BINDING_VARIANTS)
+      set(binding cucascade_s3rdma_test_binding_${variant})
+      add_library(${binding} MODULE io/s3rdma/test_binding.cpp)
+      target_compile_features(${binding} PRIVATE cxx_std_20)
+      target_compile_definitions(${binding}
+                                 PRIVATE S3RDMA_TEST_BINDING_VARIANT_${variant})
+      target_include_directories(${binding}
+                                 PRIVATE ${PROJECT_SOURCE_DIR}/include)
+      target_link_libraries(${binding} PRIVATE Threads::Threads)
+      set_target_properties(
+        ${binding} PROPERTIES PREFIX "" LIBRARY_OUTPUT_DIRECTORY
+                                        ${CUCASCADE_S3RDMA_TEST_BINDING_DIR})
+      add_dependencies(cucascade_s3rdma_tests ${binding})
+    endforeach()
+  endif()
+
+  # The cuObject binding built against a stand-in for the client's header, so
+  # that its own code runs without the SDK. Added when both files exist; the
+  # module is loaded by path like the bindings above and is not installed.
+  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/io/s3rdma/fake_cuobj/cuobjclient.h
+     AND EXISTS
+         ${CMAKE_CURRENT_SOURCE_DIR}/io/s3rdma/fake_cuobj/fake_cuobjclient.cpp)
+    add_library(
+      cucascade_s3rdma_cuobj_under_test MODULE
+      ${PROJECT_SOURCE_DIR}/src/io/s3rdma/cuobj_shim/cuobj_binding.cpp
+      io/s3rdma/fake_cuobj/fake_cuobjclient.cpp)
+    target_compile_features(cucascade_s3rdma_cuobj_under_test
+                            PRIVATE cxx_std_20)
+    target_include_directories(
+      cucascade_s3rdma_cuobj_under_test
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/io/s3rdma/fake_cuobj
+              ${PROJECT_SOURCE_DIR}/include)
+    target_link_libraries(cucascade_s3rdma_cuobj_under_test
+                          PRIVATE Threads::Threads)
+    set_target_properties(
+      cucascade_s3rdma_cuobj_under_test
+      PROPERTIES PREFIX "" LIBRARY_OUTPUT_DIRECTORY
+                           ${CUCASCADE_S3RDMA_TEST_BINDING_DIR})
+    add_dependencies(cucascade_s3rdma_tests cucascade_s3rdma_cuobj_under_test)
+  endif()
+
   target_link_libraries(cucascade_s3rdma_death_helper
                         PRIVATE cucascade_io_s3rdma Catch2::Catch2)
   target_link_libraries(cucascade_s3rdma_tests PRIVATE cucascade_io_s3rdma
