@@ -44,6 +44,62 @@ rdma::s3rdma_reactor& selected(host_fixture& f)
 
 }  // namespace
 
+TEST_CASE("S3RDMA host range identification requires the entire header grammar",
+          "[s3rdma][host][range-grammar]")
+{
+  auto const header = GENERATE("bytes 2-",
+                               "bytes 2-garbage",
+                               "bytes 2-5",
+                               "bytes 2-5/",
+                               "bytes 2-5/64x",
+                               "bytes 2-5/64 ",
+                               "bytes 2-5/*x",
+                               "bytes 5-2/64",
+                               "bytes 2-64/64",
+                               "bytes 2-5/5",
+                               "bytes 2-5/0",
+                               " bytes 2-5/64",
+                               "Bytes 2-5/64",
+                               "bytes=2-5/64",
+                               "bytes  2-5/64",
+                               "bytes */64",
+                               "bytes 2-5/-1",
+                               "bytes 184467440737095516160-5/64",
+                               "bytes 2-184467440737095516160/64",
+                               "bytes 2-5/184467440737095516160");
+  CAPTURE(header);
+  host_fixture f;
+  f.start();
+  f.controls->script(operation::range, response(206, {}, 4, header));
+  auto result = f.ctx->host_read_async(*f.object, 2, 4, f.destination.data());
+  CHECK(has_code(error_from(result), rdma::errc::control_failed));
+  CHECK(f.controls->log.count(operation::range) == 1);
+  CHECK_FALSE(f.ctx->status()->terminal());
+}
+
+TEST_CASE("S3RDMA valid range grammar accepts known and unknown lengths",
+          "[s3rdma][host][range-grammar]")
+{
+  auto const header = GENERATE("bytes 2-5/64", "bytes 2-5/*");
+  host_fixture f;
+  f.start();
+  f.controls->script(operation::range, response(206, {}, 4, header));
+  CHECK(f.ctx->host_read(*f.object, 2, 4, f.destination.data()) == 4);
+  CHECK(f.controls->log.count(operation::range) == 1);
+  CHECK(std::equal(f.source.begin() + 2, f.source.begin() + 6, f.destination.begin()));
+}
+
+TEST_CASE("S3RDMA malformed range identification prevents short-body retry",
+          "[s3rdma][host][range-grammar]")
+{
+  host_fixture f;
+  f.start();
+  f.controls->script(operation::range, response(206, {}, 3, "bytes 2-"));
+  auto result = f.ctx->host_read_async(*f.object, 2, 4, f.destination.data());
+  CHECK(has_code(error_from(result), rdma::errc::control_failed));
+  CHECK(f.controls->log.count(operation::range) == 1);
+}
+
 TEST_CASE("S3RDMA public host entries read exact scalar and vector ranges", "[s3rdma][host]")
 {
   host_fixture f;

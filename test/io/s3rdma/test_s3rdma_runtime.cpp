@@ -4,6 +4,8 @@
  */
 #include "runtime_test_support.hpp"
 
+#include <cucascade/log/logging.hpp>
+
 #include <algorithm>
 #include <limits>
 #include <tuple>
@@ -59,6 +61,30 @@ std::vector<observation> calls(journal const& log, operation op, bool returned =
   std::erase_if(result, [&](auto const& e) { return e.op != op || e.returned != returned; });
   return result;
 }
+
+struct warning_capture {
+  explicit warning_capture(std::string_view text) : match(text)
+  {
+    threshold = cucascade::log::get_min_level();
+    previous  = cucascade::log::set_sink(
+      cucascade::log::make_sink([this](cucascade::log::record const& record) {
+        if (record.lvl == cucascade::log::level::warn &&
+            record.message.find(match) != std::string_view::npos) {
+          count.fetch_add(1);
+        }
+      }),
+      cucascade::log::level::trace);
+  }
+  ~warning_capture()
+  {
+    cucascade::log::set_min_level(threshold);
+    (void)cucascade::log::set_sink(std::move(previous));
+  }
+  std::string_view match;
+  std::atomic<unsigned> count{0};
+  cucascade::log::level threshold;
+  std::shared_ptr<cucascade::log::sink> previous;
+};
 
 }  // namespace
 
@@ -216,6 +242,7 @@ TEST_CASE("S3RDMA every nonexact GET closes and settles all admission paths", "[
   CHECK(f.reactor->perf().error_total > 0);
   CHECK(f.reactor->perf().arena_leak_total > 0);
   if (leg == 3) { CHECK(f.reactor->perf().short_read_total == 1); }
+  if (leg != 3) { CHECK(f.reactor->perf().short_read_total == 0); }
   CHECK(f.reactor->perf().retries_total == 0);
   CHECK(f.controls->log.count(operation::get) == 1);
   CHECK(f.controls->log.count(operation::range) == 0);
@@ -975,4 +1002,259 @@ TEST_CASE("S3RDMA performance snapshots cover every field after the barrier", "[
   CHECK(status->torn_down());
   CHECK_FALSE(status->terminal());
   CHECK_FALSE(status->arena_retained());
+}
+
+TEST_CASE("S3RDMA sticky event cleanup stops every later call before the copy",
+          "[s3rdma][runtime][event-cleanup]")
+{
+  auto const leg = GENERATE(0, 1, 2);
+  CAPTURE(leg);
+  rendezvous capture;
+  runtime_fixture f{runtime_config(leg == 2 ? 2 : 1)};
+  std::atomic<bool> policy_terminal{false};
+  f.controls->policy_observer = [&](auto const&) {
+    policy_terminal.store(f.reactor->status()->terminal());
+  };
+  f.controls->script(operation::destroy_event, failed(cudaErrorIllegalAddress));
+  if (leg == 0) { f.controls->script(operation::flush, failed(cudaErrorInvalidValue)); }
+  if (leg == 1) {
+    action get;
+    get.change_receipt = [](auto& result) { result.callback_invocations = 0; };
+    f.controls->script(operation::get, get);
+  }
+  if (leg == 2) {
+    f.controls->script(operation::capture, held(capture));
+    f.controls->script(operation::capture, failed(cudaErrorInvalidValue));
+  }
+  f.start();
+  auto read = f.submit(0, leg == 2 ? 8 : 4);
+  if (leg == 2) {
+    REQUIRE(capture.entered());
+    REQUIRE(wait_until([&] { return !read.coordinator->should_continue(); }));
+    capture.release();
+  }
+  REQUIRE(error_from(read.future) != nullptr);
+  auto later = f.submit(16, 4, 16);
+  auto stop  = error_from(later.future);
+  CHECK(has_code(stop, leg == 1 ? rdma::errc::transport_failed : rdma::errc::device_failed));
+  CHECK(stop == f.context->gate().terminal_error());
+  std::exception_ptr host_error;
+  try {
+    (void)f.reactor->host_read(*f.object, 0, 4, f.destination.data());
+  } catch (...) {
+    host_error = std::current_exception();
+  }
+  CHECK(host_error == stop);
+  f.shutdown();
+  CHECK(f.controls->policies.load() == 1);
+  CHECK(policy_terminal.load());
+  CHECK(f.controls->log.count(operation::get) == (leg == 2 ? 0 : 1));
+  CHECK(f.controls->log.count(operation::range) == 0);
+  CHECK(f.controls->log.count(operation::copy) == 0);
+  CHECK(f.controls->log.count(operation::destroy_event) == 1);
+  CHECK(f.controls->log.count(operation::deregister_memory) == 0);
+  CHECK(f.controls->log.count(operation::free) == 0);
+  CHECK(f.controls->log.count(operation::release_session) == 0);
+  CHECK(f.reactor->perf().fail_stop_total == 1);
+  CHECK(f.reactor->perf().flush_total == 0);
+  CHECK(f.reactor->status()->terminal());
+  CHECK(f.reactor->status()->arena_retained());
+  CHECK(f.reactor->status()->torn_down());
+  CHECK_FALSE(capture.timed_out());
+  no_calls_after_sticky(f.controls->log);
+}
+
+TEST_CASE("S3RDMA ordinary event cleanup warns and preserves the flush error",
+          "[s3rdma][runtime][event-cleanup]")
+{
+  auto const throws = GENERATE(false, true);
+  warning_capture warnings{"a CUDA event could not be destroyed"};
+  runtime_fixture f;
+  f.controls->script(operation::flush, failed(cudaErrorInvalidValue));
+  auto destroy   = failed(cudaErrorInvalidValue);
+  destroy.throws = throws;
+  f.controls->script(operation::destroy_event, destroy);
+  f.start();
+  auto read  = f.submit(0, 4);
+  auto error = error_from(read.future);
+  REQUIRE(has_code(error, rdma::errc::device_failed));
+  try {
+    std::rethrow_exception(error);
+  } catch (std::exception const& e) {
+    CHECK(std::string_view{e.what()}.find("cudaDeviceFlushGPUDirectRDMAWrites") !=
+          std::string_view::npos);
+  }
+  CHECK(warnings.count.load() == 1);
+  CHECK(f.reactor->perf().flush_total == 0);
+  CHECK(f.controls->policies.load() == 0);
+  CHECK_FALSE(f.reactor->status()->terminal());
+  auto next = f.submit(8, 4, 8);
+  delivered(next, 4);
+  f.shutdown();
+  CHECK(f.reactor->perf().flush_total == 1);
+  CHECK(f.controls->log.count(operation::destroy_event) == 2);
+  CHECK(f.controls->log.count(operation::deregister_memory) == 1);
+  CHECK(f.controls->log.count(operation::free) == 1);
+}
+
+TEST_CASE("S3RDMA device restore failures retain the first startup error and released state",
+          "[s3rdma][runtime][device-restore]")
+{
+  auto const phase = GENERATE(0, 1, 2);
+  CAPTURE(phase);
+  warning_capture warnings{"could not be put back"};
+  runtime_fixture f;
+  if (phase == 0) { f.start(); }
+  f.controls->script(operation::set_device, {});
+  f.controls->script(operation::set_device, failed(cudaErrorInvalidValue));
+  if (phase == 2) { f.controls->script(operation::allocate, failed(cudaErrorMemoryAllocation)); }
+  if (phase != 0) {
+    std::exception_ptr error;
+    try {
+      f.start();
+    } catch (...) {
+      error = std::current_exception();
+    }
+    REQUIRE(has_code(error, rdma::errc::device_failed));
+    try {
+      std::rethrow_exception(error);
+    } catch (std::exception const& e) {
+      CHECK(std::string_view{e.what()}.find(phase == 1 ? "cudaSetDevice" : "cudaMalloc") !=
+            std::string_view::npos);
+    }
+  }
+  f.shutdown();
+  if (phase != 1) { CHECK(warnings.count.load() == 1); }
+  CHECK(f.reactor->status()->torn_down());
+  CHECK_FALSE(f.reactor->status()->terminal());
+  CHECK_FALSE(f.reactor->status()->arena_retained());
+  CHECK(f.reactor->perf().arena_leak_total == 0);
+  CHECK(f.controls->policies.load() == 0);
+  CHECK(f.controls->log.count(operation::deregister_memory) == (phase == 2 ? 0 : 1));
+  CHECK(f.controls->log.count(operation::free) == (phase == 2 ? 0 : 1));
+}
+
+namespace {
+
+void entry_race(rdma::backend_call point, operation expected, bool already_delivered)
+{
+  rendezvous before_entry;
+  std::atomic<bool> armed{false};
+  std::atomic<bool> policy_terminal{false};
+  std::thread::id caller;
+  runtime_fixture f{runtime_config(2)};
+  auto ops        = f.controls->delivery();
+  ops.before_call = [&](rdma::backend_call call) {
+    if (call == point && armed.exchange(false)) {
+      caller = std::this_thread::get_id();
+      before_entry.arrive_and_wait();
+    }
+  };
+  f.context = std::make_shared<rdma::s3rdma_reactor::reactor_context>(
+    f.cfg, f.controls->clients(), std::move(ops), f.controls->policy());
+  f.reactor                   = std::make_unique<rdma::s3rdma_reactor>(f.context);
+  f.controls->policy_observer = [&](auto const&) {
+    policy_terminal.store(f.reactor->status()->terminal());
+  };
+  f.start();
+  armed.store(true);
+  auto first = f.submit(0, 4);
+  REQUIRE(before_entry.entered());
+  f.controls->script(operation::capture, failed(cudaErrorIllegalAddress));
+  auto second = f.submit(8, 4, 8);
+  auto stop   = error_from(second.future);
+  REQUIRE(has_code(stop, rdma::errc::device_failed));
+  CHECK_FALSE(first.future.is_ready());
+  before_entry.release();
+  if (already_delivered) {
+    delivered(first, 4);
+    CHECK(std::equal(f.source.begin(), f.source.begin() + 4, f.destination.begin()));
+  } else {
+    CHECK(error_from(first.future) == stop);
+    CHECK(first.completion->calls.load() == 1);
+    CHECK_FALSE(first.completion->success.load());
+    CHECK(
+      std::all_of(f.destination.begin(), f.destination.end(), [](auto b) { return b == 0xcc; }));
+  }
+  f.shutdown();
+  for (auto const& e : f.controls->log.snapshot()) {
+    if (e.thread == caller && !e.returned) {
+      CHECK(e.op != expected);
+      if (point == rdma::backend_call::memcpy_async) {
+        CHECK(e.op != operation::record);
+        CHECK(e.op != operation::wait);
+      }
+    }
+  }
+  CHECK(f.controls->policies.load() == 1);
+  CHECK(policy_terminal.load());
+  CHECK(f.controls->log.count(operation::destroy_event) == 0);
+  CHECK(f.controls->log.count(operation::deregister_memory) == 0);
+  CHECK(f.controls->log.count(operation::free) == 0);
+  CHECK(f.controls->log.count(operation::release_session) == 0);
+  CHECK(f.reactor->status()->terminal());
+  CHECK(f.reactor->status()->arena_retained());
+  CHECK(f.reactor->status()->torn_down());
+  CHECK(f.reactor->perf().fail_stop_total == 1);
+  CHECK_FALSE(before_entry.timed_out());
+  no_calls_after_sticky(f.controls->log);
+}
+
+}  // namespace
+
+TEST_CASE("S3RDMA a stopped backend refuses calls held before their entry",
+          "[s3rdma][runtime][call-entry]")
+{
+  auto const leg = GENERATE(0, 1, 2, 3, 4, 5);
+  CAPTURE(leg);
+  std::array points{rdma::backend_call::set_device,
+                    rdma::backend_call::stream_capture_query,
+                    rdma::backend_call::event_create,
+                    rdma::backend_call::data_get,
+                    rdma::backend_call::flush,
+                    rdma::backend_call::memcpy_async};
+  std::array operations{operation::set_device,
+                        operation::capture,
+                        operation::create_event,
+                        operation::get,
+                        operation::flush,
+                        operation::copy};
+  entry_race(
+    points.at(static_cast<std::size_t>(leg)), operations.at(static_cast<std::size_t>(leg)), false);
+}
+
+TEST_CASE("S3RDMA refused post-wait cleanup does not undo delivered bytes",
+          "[s3rdma][runtime][call-entry]")
+{
+  entry_race(rdma::backend_call::event_destroy, operation::destroy_event, true);
+}
+
+TEST_CASE("S3RDMA an entered GET returns after stop without starting another operation",
+          "[s3rdma][runtime][call-entry]")
+{
+  rendezvous get;
+  runtime_fixture f{runtime_config(2)};
+  auto step       = held(get);
+  step.get_offset = 0;
+  f.controls->script(operation::get, step);
+  f.start();
+  auto first = f.submit(0, 4);
+  REQUIRE(get.entered());
+  f.controls->script(operation::capture, failed(cudaErrorIllegalAddress));
+  auto second = f.submit(8, 4, 8);
+  auto stop   = error_from(second.future);
+  REQUIRE(has_code(stop, rdma::errc::device_failed));
+  get.release();
+  CHECK(error_from(first.future) == stop);
+  f.shutdown();
+  CHECK(f.controls->log.count(operation::get) == 1);
+  CHECK(f.controls->log.count(operation::get, true) == 1);
+  CHECK(f.controls->log.count(operation::flush) == 0);
+  CHECK(f.controls->log.count(operation::copy) == 0);
+  CHECK(f.controls->log.count(operation::destroy_event) == 0);
+  CHECK(first.completion->calls.load() == 1);
+  CHECK_FALSE(first.completion->success.load());
+  CHECK(f.controls->policies.load() == 1);
+  CHECK_FALSE(get.timed_out());
+  no_calls_after_sticky(f.controls->log);
 }

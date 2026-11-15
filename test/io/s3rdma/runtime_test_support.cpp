@@ -9,6 +9,20 @@
 #include <stdexcept>
 
 namespace cucascade::test::s3rdma {
+thread_local std::size_t native_device_queries{0};
+}
+
+extern "C" cudaError_t CUDARTAPI __real_cudaGetDevice(int*) __attribute__((weak));
+
+// --wrap observes the framework's query too, including with a static CUDA runtime.
+extern "C" cudaError_t CUDARTAPI __wrap_cudaGetDevice(int* device)
+{
+  if (__real_cudaGetDevice == nullptr) { std::abort(); }
+  ++cucascade::test::s3rdma::native_device_queries;
+  return __real_cudaGetDevice(device);
+}
+
+namespace cucascade::test::s3rdma {
 
 void journal::append(observation value) noexcept
 {

@@ -189,8 +189,16 @@ if(CUCASCADE_BUILD_S3_RDMA)
                         PRIVATE cucascade_io_s3rdma Catch2::Catch2)
   target_link_libraries(cucascade_s3rdma_tests PRIVATE cucascade_io_s3rdma
                                                        Catch2::Catch2WithMain)
-  target_link_libraries(cucascade_s3rdma_gpu_tests
-                        PRIVATE cucascade_io_s3rdma Catch2::Catch2WithMain)
+  # The GPU suite counts native cudaGetDevice calls, including the one the
+  # framework makes inside the component. A call can only be redirected in the
+  # link that contains it, so this executable links the component's objects
+  # instead of its library and wraps the symbol there. No shipped target is
+  # linked differently.
+  target_link_libraries(
+    cucascade_s3rdma_gpu_tests PRIVATE cucascade_io_s3rdma_objects cucascade_io
+                                       Catch2::Catch2WithMain)
+  target_link_options(cucascade_s3rdma_gpu_tests PRIVATE
+                      LINKER:--wrap=cudaGetDevice)
   add_dependencies(cucascade_s3rdma_tests cucascade_s3rdma_death_helper)
 
   add_test(NAME cucascade_s3rdma_tests COMMAND cucascade_s3rdma_tests --order

@@ -8,6 +8,8 @@
 
 #include <fcntl.h>
 #include <spawn.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -22,9 +24,10 @@ using namespace cucascade::test::s3rdma;
 namespace {
 
 struct pipe_pair {
-  pipe_pair()
+  explicit pipe_pair(bool socket = false)
   {
-    if (pipe2(descriptors.data(), O_CLOEXEC) != 0) {
+    if ((socket ? socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, descriptors.data())
+                : pipe2(descriptors.data(), O_CLOEXEC)) != 0) {
       throw std::runtime_error("pipe creation failed");
     }
   }
@@ -35,6 +38,19 @@ struct pipe_pair {
     }
   }
   std::array<int, 2> descriptors{-1, -1};
+};
+
+struct temporary_file {
+  temporary_file()
+  {
+    char name[] = "/tmp/cucascade-fatal-XXXXXX";
+    fd          = mkstemp(name);
+    if (fd < 0) { throw std::runtime_error("temporary file creation failed"); }
+    (void)unlink(name);
+    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+  }
+  ~temporary_file() { (void)close(fd); }
+  int fd{-1};
 };
 
 struct child_guard {
@@ -59,14 +75,16 @@ struct spawn_actions {
   posix_spawn_file_actions_t value;
 };
 
-void dies(std::string mode, bool full_stderr = false, bool policy = false)
+void dies(std::string mode, bool full_stderr = false, bool policy = false, int sink_kind = 0)
 {
   deadline bound;
   auto const* helper = std::getenv("S3RDMA_DEATH_HELPER");
   REQUIRE(helper != nullptr);
   REQUIRE(access(helper, X_OK) == 0);
   pipe_pair output;
-  pipe_pair diagnostics;
+  pipe_pair diagnostics{sink_kind == 4};
+  std::unique_ptr<temporary_file> regular;
+  if (sink_kind == 1) { regular = std::make_unique<temporary_file>(); }
   REQUIRE(fcntl(output.descriptors[0], F_SETFL, O_NONBLOCK) == 0);
   if (full_stderr) {
     REQUIRE(fcntl(diagnostics.descriptors[1], F_SETFL, O_NONBLOCK) == 0);
@@ -75,14 +93,22 @@ void dies(std::string mode, bool full_stderr = false, bool policy = false)
     REQUIRE(errno == EAGAIN);
     REQUIRE(fcntl(diagnostics.descriptors[1], F_SETFL, 0) == 0);
   }
+  auto const inherited_flags = fcntl(diagnostics.descriptors[1], F_GETFL);
+  REQUIRE(inherited_flags >= 0);
   spawn_actions actions;
   REQUIRE(posix_spawn_file_actions_adddup2(&actions.value, output.descriptors[1], STDOUT_FILENO) ==
           0);
   REQUIRE(posix_spawn_file_actions_addclose(&actions.value, output.descriptors[0]) == 0);
   REQUIRE(posix_spawn_file_actions_addclose(&actions.value, output.descriptors[1]) == 0);
-  if (full_stderr) {
+  if (full_stderr || sink_kind == 3 || sink_kind == 4) {
     REQUIRE(posix_spawn_file_actions_adddup2(
               &actions.value, diagnostics.descriptors[1], STDERR_FILENO) == 0);
+  }
+  if (sink_kind == 1) {
+    REQUIRE(posix_spawn_file_actions_adddup2(&actions.value, regular->fd, STDERR_FILENO) == 0);
+  }
+  if (sink_kind == 2) {
+    REQUIRE(posix_spawn_file_actions_addclose(&actions.value, STDERR_FILENO) == 0);
   }
   std::string executable{helper};
   std::array<char*, 3> arguments{executable.data(), mode.data(), nullptr};
@@ -120,9 +146,34 @@ void dies(std::string mode, bool full_stderr = false, bool policy = false)
   CHECK(markers.find("FUTURE_SETTLED") == std::string::npos);
   CHECK(markers.find("CLEANUP") == std::string::npos);
   CHECK(markers.find("SETUP_OR_PROPAGATION_FAILURE") == std::string::npos);
-  if (full_stderr) {
-    CHECK(((WIFEXITED(status) && WEXITSTATUS(status) == 86) ||
-           (WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT)));
+  if (full_stderr || sink_kind != 0) {
+    CHECK(WIFSIGNALED(status));
+    CHECK(WTERMSIG(status) == SIGABRT);
+    CHECK(markers.find("TERMINATE") == std::string::npos);
+    CHECK(fcntl(diagnostics.descriptors[1], F_GETFL) == inherited_flags);
+    if (full_stderr) { CHECK((fcntl(diagnostics.descriptors[1], F_GETFL) & O_NONBLOCK) == 0); }
+    if (regular) {
+      struct stat metadata{};
+      REQUIRE(fstat(regular->fd, &metadata) == 0);
+      CHECK(metadata.st_size == 0);
+    }
+    if (sink_kind == 3 || sink_kind == 4) {
+      REQUIRE(fcntl(diagnostics.descriptors[0], F_SETFL, O_NONBLOCK) == 0);
+      std::string line;
+      for (;;) {
+        auto count = read(diagnostics.descriptors[0], bytes.data(), bytes.size());
+        if (count > 0) {
+          line.append(bytes.data(), static_cast<std::size_t>(count));
+        } else if (count < 0 && errno == EINTR) {
+          continue;
+        } else {
+          break;
+        }
+      }
+      CHECK(line ==
+            "s3rdma: fatal CUDA failure while delivering data: delivery failure: "
+            "cudaErrorInvalidValue\n");
+    }
   } else {
     CHECK(WIFEXITED(status));
     CHECK(WEXITSTATUS(status) == 86);
@@ -183,6 +234,20 @@ TEST_CASE("S3RDMA a throwing fatal hook is contained by termination", "[s3rdma][
 TEST_CASE("S3RDMA default fatal diagnostics cannot block on a full pipe", "[s3rdma][death]")
 {
   dies("default-full-pipe", true);
+}
+TEST_CASE("S3RDMA default fatal hook aborts without writing to unavailable sinks",
+          "[s3rdma][death][fatal-sinks]")
+{
+  auto const sink_kind = GENERATE(1, 2);
+  CAPTURE(sink_kind);
+  dies("default-full-pipe", false, false, sink_kind);
+}
+TEST_CASE("S3RDMA default fatal hook writes one line to a pipe or socket",
+          "[s3rdma][death][fatal-sinks]")
+{
+  auto const sink_kind = GENERATE(3, 4);
+  CAPTURE(sink_kind);
+  dies("default-full-pipe", false, false, sink_kind);
 }
 TEST_CASE("S3RDMA a throwing health policy cannot unwind cleanup", "[s3rdma][death]")
 {

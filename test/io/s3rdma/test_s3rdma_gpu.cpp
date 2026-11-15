@@ -240,3 +240,231 @@ TEST_CASE("S3RDMA framework dispatch failure invokes the context-health probe", 
   }
   REQUIRE(witnessed);
 }
+
+TEST_CASE("S3RDMA public dispatch held before entry loses to a context-fatal stop",
+          "[s3rdma][gpu][dispatch-entry]")
+{
+  auto const queries = native_device_queries;
+  int device         = -1;
+  REQUIRE(cudaGetDevice(&device) == cudaSuccess);
+  REQUIRE(native_device_queries == queries + 1);
+  {
+    gpu_fixture control;
+    control.ctx->start();
+    auto const before = native_device_queries;
+    auto read         = control.ctx->mixed_readv_async_io(*control.object, {control.slice(0, 4)});
+    REQUIRE(native_device_queries > before);
+    REQUIRE(wait_until([&] { return read.is_ready(); }));
+    CHECK(std::move(read).get(2s) == 4);
+  }
+  rendezvous capture;
+  rendezvous dispatch;
+  std::atomic<bool> armed{false};
+  gpu_fixture f{[&](auto& ops, auto const&) {
+    ops.before_call = [&](rdma::backend_call call) {
+      if (call == rdma::backend_call::dispatch && armed.exchange(false)) {
+        dispatch.arrive_and_wait();
+      }
+    };
+  }};
+  f.ctx->start();
+  auto reactors = f.ctx->next_reactor(*f.object, 1, rdma::s3rdma_ioctx::io_op_type::host, 0);
+  REQUIRE(reactors.size() == 1);
+  action fault;
+  fault.result = cudaErrorIllegalAddress;
+  fault.before = [&](auto const&) { capture.arrive_and_wait(); };
+  f.controls->script(operation::capture, fault);
+  auto earlier = f.ctx->mixed_readv_async_io(*f.object, {f.slice(16, 4, 16)});
+  REQUIRE(capture.entered());
+  auto const requests = reactors.front()->perf().requests_total;
+  auto first          = std::make_shared<completion_record>();
+  auto second         = std::make_shared<completion_record>();
+  std::vector<io::prepared_io_slice> slices{f.slice(0, 4), f.slice(8, 4, 8)};
+  slices[0].on_complete = first->callback();
+  slices[1].on_complete = second->callback();
+  workers threads;
+  armed.store(true);
+  auto submitting = threads.launch([&] {
+    auto const before = native_device_queries;
+    auto result       = f.ctx->mixed_readv_async_io(*f.object, std::move(slices));
+    return std::pair{std::move(result), native_device_queries - before};
+  });
+  REQUIRE(dispatch.entered());
+  capture.release();
+  auto stop = error_from(earlier);
+  REQUIRE(has_code(stop, rdma::errc::device_failed));
+  dispatch.release();
+  auto result = ready(submitting);
+  CHECK(has_code(error_from(result.first), rdma::errc::device_failed));
+  CHECK(result.second == 0);
+  CHECK(reactors.front()->perf().requests_total == requests);
+  for (auto const& completion : {first, second}) {
+    CHECK(completion->calls.load() == 1);
+    CHECK_FALSE(completion->success.load());
+  }
+  f.ctx->shutdown();
+  CHECK(f.controls->policies.load() == 1);
+  CHECK(f.policy_saw_terminal.load());
+  CHECK(f.controls->log.count(operation::get) == 0);
+  CHECK_FALSE(capture.timed_out());
+  CHECK_FALSE(dispatch.timed_out());
+}
+
+TEST_CASE("S3RDMA a dropped-slice callback does not hold an admitted dispatch",
+          "[s3rdma][gpu][dispatch-entry]")
+{
+  auto const close_during_callback = GENERATE(false, true);
+  rendezvous callback;
+  gpu_fixture f;
+  f.ctx->start();
+  auto empty  = std::make_shared<completion_record>();
+  auto beyond = std::make_shared<completion_record>();
+  auto live   = std::make_shared<completion_record>();
+  if (close_during_callback) {
+    empty->after = [&] { callback.arrive_and_wait(); };
+  }
+  std::vector<io::prepared_io_slice> slices{f.slice(0, 0), f.slice(64, 4, 8), f.slice(0, 4, 16)};
+  slices[0].on_complete = empty->callback();
+  slices[1].on_complete = beyond->callback();
+  slices[2].on_complete = live->callback();
+  workers threads;
+  auto submitting =
+    threads.launch([&] { return f.ctx->mixed_readv_async_io(*f.object, std::move(slices)); });
+  if (close_during_callback) {
+    REQUIRE(callback.entered());
+    auto closing = threads.launch([&] { f.ctx->shutdown(); });
+    ready(closing);
+    CHECK(f.ctx->status()->torn_down());
+    CHECK_FALSE(f.ctx->status()->terminal());
+    CHECK_FALSE(f.ctx->status()->arena_retained());
+    CHECK(f.controls->log.count(operation::deregister_memory) == 1);
+    CHECK(f.controls->log.count(operation::free) == 1);
+    callback.release();
+  }
+  auto result = ready(submitting);
+  if (close_during_callback) {
+    CHECK(has_code(error_from(result), rdma::errc::transport_closed));
+    CHECK(f.controls->log.count(operation::get) == 0);
+  } else {
+    REQUIRE(wait_until([&] { return result.is_ready(); }));
+    CHECK(std::move(result).get(2s) == 4);
+    auto bytes = f.bytes();
+    CHECK(std::equal(f.source.begin(), f.source.begin() + 4, bytes.begin() + 16));
+  }
+  CHECK(empty->calls.load() == 1);
+  CHECK_FALSE(empty->success.load());
+  CHECK(beyond->calls.load() == 1);
+  CHECK_FALSE(beyond->success.load());
+  CHECK(live->calls.load() == 1);
+  CHECK(live->success.load() == !close_during_callback);
+  CHECK_FALSE(callback.timed_out());
+}
+
+TEST_CASE("S3RDMA shutdown waits for the admitted dispatch health probe",
+          "[s3rdma][gpu][dispatch-entry]")
+{
+  auto const sticky = GENERATE(false, true);
+  bool witnessed    = false;
+  for (std::size_t index = 1; index <= 32 && !witnessed; ++index) {
+    rendezvous probe;
+    std::atomic<bool> armed{false};
+    std::atomic<bool> at_probe{false};
+    std::thread::id caller;
+    auto const code = sticky ? cudaErrorIllegalAddress : cudaErrorInvalidValue;
+    gpu_fixture f{[&](auto& ops, auto const& controls) {
+      auto ordinary  = ops.get_device;
+      ops.get_device = [&, ordinary, controls](int* device) {
+        if (armed.load() && std::this_thread::get_id() == caller) {
+          observation event{operation::get_device};
+          controls->log.append(event);
+          event.result   = code;
+          event.returned = true;
+          controls->log.append(event);
+          return code;
+        }
+        return ordinary(device);
+      };
+      ops.before_call = [&](rdma::backend_call call) {
+        if (call == rdma::backend_call::get_device && armed.load() &&
+            std::this_thread::get_id() == caller) {
+          at_probe.store(true);
+          probe.arrive_and_wait();
+        }
+      };
+    }};
+    f.ctx->start();
+    auto completion   = std::make_shared<completion_record>();
+    auto slice        = f.slice(0, 4);
+    slice.on_complete = completion->callback();
+    std::vector<io::prepared_io_slice> slices{slice};
+    workers threads;
+    auto submitting = threads.launch([&] {
+      int current = -1;
+      cuda_ok(cudaGetDevice(&current));
+      caller = std::this_thread::get_id();
+      armed.store(true);
+      cucascade::test::scoped_allocation_counter allocation;
+      allocation.fail_at(index);
+      auto result = f.ctx->mixed_readv_async_io(*f.object, std::move(slices));
+      armed.store(false);
+      return result;
+    });
+    REQUIRE(wait_until(
+      [&] { return at_probe.load() || submitting.wait_for(0ms) == std::future_status::ready; }));
+    if (!at_probe.load()) {
+      auto result = ready(submitting);
+      (void)error_from(result);
+      continue;
+    }
+    witnessed = true;
+    REQUIRE(probe.entered());
+    auto closing = threads.launch([&] { f.ctx->shutdown(); });
+    std::array<std::uint8_t, 4> host{};
+    REQUIRE(wait_until([&] {
+      try {
+        (void)f.ctx->host_read(*f.object, 0, host.size(), host.data());
+      } catch (...) {
+        return has_code(std::current_exception(), rdma::errc::transport_closed);
+      }
+      return false;
+    }));
+    CHECK(closing.wait_for(0ms) != std::future_status::ready);
+    CHECK_FALSE(f.ctx->status()->torn_down());
+    CHECK(f.controls->log.count(operation::deregister_memory) == 0);
+    CHECK(f.controls->log.count(operation::free) == 0);
+    CHECK(f.controls->log.count(operation::release_session) == 0);
+    probe.release();
+    auto result = ready(submitting);
+    REQUIRE(wait_until([&] { return result.is_ready(); }));
+    CHECK_THROWS_AS(std::move(result).get(2s), std::bad_alloc);
+    ready(closing);
+    CHECK(completion->calls.load() == 1);
+    CHECK_FALSE(completion->success.load());
+    CHECK(f.ctx->status()->torn_down());
+    CHECK(f.ctx->status()->terminal() == sticky);
+    CHECK(f.ctx->status()->arena_retained() == sticky);
+    CHECK(f.controls->policies.load() == (sticky ? 1 : 0));
+    CHECK(f.controls->log.count(operation::deregister_memory) == (sticky ? 0 : 1));
+    CHECK(f.controls->log.count(operation::free) == (sticky ? 0 : 1));
+    auto entries  = f.controls->log.snapshot();
+    auto returned = std::find_if(entries.begin(), entries.end(), [&](auto const& e) {
+      return e.op == operation::get_device && e.returned && e.result == code;
+    });
+    REQUIRE(returned != entries.end());
+    for (auto it = entries.begin(); it != returned; ++it) {
+      CHECK(it->op != operation::deregister_memory);
+      CHECK(it->op != operation::free);
+      CHECK(it->op != operation::release_session);
+    }
+    if (sticky) {
+      CHECK(f.policy_saw_terminal.load());
+      for (auto it = returned + 1; it != entries.end(); ++it) {
+        if (!it->returned) {
+          CHECK((it->op == operation::policy || it->op == operation::worker_exit));
+        }
+      }
+    }
+    CHECK_FALSE(probe.timed_out());
+  }
+  REQUIRE(witnessed);
+}

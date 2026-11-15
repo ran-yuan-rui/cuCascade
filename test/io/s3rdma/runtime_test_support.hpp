@@ -21,6 +21,8 @@ namespace cucascade::test::s3rdma {
 
 using future_type = exec::semi_future<std::size_t>;
 
+extern thread_local std::size_t native_device_queries;
+
 enum class operation {
   get_device,
   set_device,
