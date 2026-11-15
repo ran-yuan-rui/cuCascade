@@ -53,10 +53,12 @@ struct control_client_config {
 /**
  * @brief The control client of the backend over HTTP.
  *
- * One request per call: nothing is retried and no redirect is followed.  A
- * HEAD reports a response without one usable @c Content-Length as a transport
- * error, never as an object of size zero.  A range GET writes at most the
- * requested bytes and stops reading a body that is longer.
+ * One request per call: the client repeats nothing and follows no redirect.
+ * Connections are kept between calls, and the transport sends a request again
+ * by itself when a kept connection turns out to be closed before any response
+ * arrived.  A HEAD reports a response without one usable @c Content-Length as
+ * a transport error, never as an object of size zero.  A range GET writes at
+ * most the requested bytes and stops reading a body that is longer.
  *
  * @param authorizer Authorizes requests to the control endpoint, in either
  *                   signing form.  @c Range and @c If-Match are sent outside

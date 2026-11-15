@@ -415,8 +415,9 @@ std::int64_t send_request(get_state& state, cucascade_s3rdma_request const& requ
   while (!token.empty() && token.back() == '\0') {
     token.remove_suffix(1);
   }
+  // Visible ASCII only: anything else has no single form as a header value.
   if (token.empty() || !std::all_of(token.begin(), token.end(), [](char c) {
-        return static_cast<unsigned char>(c) > 0x20 && c != 0x7f;
+        return static_cast<unsigned char>(c) > 0x20 && static_cast<unsigned char>(c) < 0x7f;
       })) {
     state.failure = "the RDMA descriptor cannot be sent as a header value";
     return refused;

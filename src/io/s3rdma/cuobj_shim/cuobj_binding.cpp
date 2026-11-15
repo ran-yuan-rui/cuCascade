@@ -25,17 +25,33 @@
 #include <cuobjclient.h>
 #include <sys/types.h>
 
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
+#include <memory>
 #include <new>
 
-struct cucascade_s3rdma_session {
-  cuObjClient* client{nullptr};
-  // The request callback of the GET in progress.  Kept in the session rather
-  // than in the frame of get: the client may run its callback late.
+namespace {
+
+// The request callback of one GET and the context it runs with.
+struct get_call {
   std::atomic<cucascade_s3rdma_request_fn> request{nullptr};
   std::atomic<void*> context{nullptr};
+};
+
+}  // namespace
+
+struct cucascade_s3rdma_session {
+  // Handed to the client by reference, so it lives as long as the client.
+  CUObjOps_t ops{};
+  cuObjClient* client{nullptr};
+  // Each GET hands the client a call of its own, so a callback the client runs
+  // late still arrives with the context of the GET it belongs to.  Kept in the
+  // session rather than in the frame of get, and used again only several GETs
+  // later.
+  std::array<get_call, 8> calls{};
+  std::atomic<std::uint64_t> issued{0};
 };
 
 namespace {
@@ -47,16 +63,16 @@ ssize_t on_get(const void* handle,
                loff_t offset,
                const cufileRDMAInfo_t* rdma) noexcept
 {
-  auto* const session = static_cast<cucascade_s3rdma_session*>(cuObjClient::getCtx(handle));
-  if (session == nullptr) { return -ENOTSUP; }
-  auto const request = session->request.load(std::memory_order_acquire);
+  auto* const call = static_cast<get_call*>(cuObjClient::getCtx(handle));
+  if (call == nullptr) { return -ENOTSUP; }
+  auto const request = call->request.load(std::memory_order_acquire);
   if (request == nullptr) { return -ENOTSUP; }
   cucascade_s3rdma_request what{};
   what.descriptor        = rdma != nullptr ? rdma->desc_str : nullptr;
   what.descriptor_length = rdma != nullptr ? static_cast<size_t>(rdma->desc_len) : 0;
   what.size              = size;
   what.offset            = static_cast<int64_t>(offset);
-  return static_cast<ssize_t>(request(session->context.load(std::memory_order_acquire), &what));
+  return static_cast<ssize_t>(request(call->context.load(std::memory_order_acquire), &what));
 }
 
 int32_t probe(cucascade_s3rdma_probe* out) noexcept
@@ -74,17 +90,11 @@ int32_t session_create(cucascade_s3rdma_session** out) noexcept
   if (out == nullptr) { return 1; }
   *out = nullptr;
   try {
-    auto* const session = new cucascade_s3rdma_session;
-    CUObjOps_t ops{};
-    ops.get = &on_get;
-    ops.put = nullptr;
-    try {
-      session->client = new cuObjClient(ops, CUOBJ_PROTO_RDMA_DC_V1);
-    } catch (...) {
-      delete session;
-      return 1;
-    }
-    *out = session;
+    auto session     = std::make_unique<cucascade_s3rdma_session>();
+    session->ops.get = &on_get;
+    session->ops.put = nullptr;
+    session->client  = new cuObjClient(session->ops, CUOBJ_PROTO_RDMA_DC_V1);
+    *out             = session.release();
     return 0;
   } catch (...) {
     return 1;
@@ -145,13 +155,15 @@ int64_t get(cucascade_s3rdma_session* session,
   if (session == nullptr || base == nullptr || request == nullptr) {
     return CUCASCADE_S3RDMA_NO_RESULT;
   }
-  session->context.store(context, std::memory_order_release);
-  session->request.store(request, std::memory_order_release);
+  auto& call =
+    session->calls[session->issued.fetch_add(1, std::memory_order_acq_rel) % session->calls.size()];
+  call.context.store(context, std::memory_order_release);
+  call.request.store(request, std::memory_order_release);
   try {
     // The registered base with the destination as buf_offset: an interior
     // pointer would not name the registration.
     return static_cast<int64_t>(
-      session->client->cuObjGet(session, base, length, 0, static_cast<loff_t>(destination_offset)));
+      session->client->cuObjGet(&call, base, length, 0, static_cast<loff_t>(destination_offset)));
   } catch (...) {
     return CUCASCADE_S3RDMA_NO_RESULT;
   }
