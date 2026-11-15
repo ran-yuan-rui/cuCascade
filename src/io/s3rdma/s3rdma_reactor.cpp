@@ -601,8 +601,9 @@ std::exception_ptr s3rdma_reactor::bring_up() noexcept
       failure = stop_error();
     }
   }
-  // Putting the caller's device back is an attempt: it is not made once calls
-  // may no longer start, and its failure does not replace an earlier one.
+  // Restoring the caller's device is attempted only while calls may start.
+  // A non-sticky restore failure preserves an earlier start error; a sticky
+  // failure takes the context-fatal path.
   if (selected) {
     auto const rc = shared.cuda(backend_call::set_device, [&] { return ops.set_device(previous); });
     if (rc.has_value() && *rc != cudaSuccess) {

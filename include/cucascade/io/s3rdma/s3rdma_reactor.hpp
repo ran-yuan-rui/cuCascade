@@ -198,10 +198,11 @@ class s3rdma_reactor {
   /**
    * @brief Allocate and register the landing arenas and start the workers.
    *
-   * Calls CUDA on the calling thread and then tries to put that thread's
-   * current device back.  If that fails the start fails; when the start had
-   * already failed, it is only logged.  A second call after success does
-   * nothing.
+   * Calls CUDA on the calling thread and then tries to restore that thread's
+   * current device.  A non-sticky restore failure fails an otherwise successful
+   * start and is only logged if start already failed.  A sticky restore failure
+   * takes the context-fatal path and is returned as the start error.  A second
+   * call after success does nothing.
    *
    * @throws std::exception the backend did not start.  Everything acquired
    *         was released again unless a release failed or a CUDA error left

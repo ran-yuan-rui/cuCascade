@@ -166,11 +166,11 @@ struct context_fatal_report {
  * Called at most once per backend instance, after the backend stopped
  * admitting work and stopped starting CUDA and transport calls.  A call that
  * had already started still returns, and a copy out of the landing memory
- * that was already submitted is still waited for.  Landing memory that was
- * allocated stays allocated and registered; when the error occurs while the
- * backend starts, there may be none yet.  The policy may terminate the
- * process or return; an exception leaving it terminates the process.  It must
- * not call back into the backend.  An empty policy is not called.
+ * that was already submitted is still waited for.  Landing memory and
+ * registrations still held at that point are retained; startup may have
+ * acquired none or only part of them.  The policy may terminate the process
+ * or return; an exception leaving it terminates the process.  It must not
+ * call back into the backend.  An empty policy is not called.
  */
 using context_health_policy = std::function<void(context_fatal_report const&)>;
 
