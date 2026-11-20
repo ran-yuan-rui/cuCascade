@@ -147,6 +147,24 @@ void reject_amz_query_params(std::string_view canonical_query)
   }
 }
 
+// A malformed header name as a message may carry it: it is the caller's text
+// and may be anything, so bytes outside printable ASCII are replaced and a
+// long name is cut.
+std::string printable_name(std::string_view name)
+{
+  constexpr std::size_t limit = 64;
+  std::string out{name.substr(0, limit)};
+  std::replace_if(
+    out.begin(),
+    out.end(),
+    [](char c) {
+      return static_cast<unsigned char>(c) < 0x20 || static_cast<unsigned char>(c) > 0x7e;
+    },
+    '?');
+  if (name.size() > limit) { out += "..."; }
+  return out;
+}
+
 // Headers a caller asks to have signed. A name the signer adds itself would be
 // signed twice; a control character could end the header line; a run of spaces
 // is collapsed by the verifier but not by sign_request. Messages name the
@@ -163,7 +181,8 @@ void check_signed_headers(std::vector<std::pair<std::string, std::string>> const
       return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '-' || c == '_';
     });
     if (!token) {
-      throw credential_error("sigv4_header_authorizer: malformed name of a header to sign");
+      throw credential_error("sigv4_header_authorizer: malformed header name '" +
+                             printable_name(name) + "'");
     }
     if (std::find(reserved.begin(), reserved.end(), lowered) != reserved.end() ||
         std::find(seen.begin(), seen.end(), lowered) != seen.end()) {

@@ -293,8 +293,9 @@ class curl_control_client final : public s3_control_client {
                                       std::uint8_t* host_dst,
                                       std::string_view if_match) override
   {
-    if (size == 0 || host_dst == nullptr ||
-        size >= std::numeric_limits<std::size_t>::max() - offset) {
+    // The largest size is refused as well: size + 1 reports a longer body.
+    if (size == 0 || host_dst == nullptr || size == std::numeric_limits<std::size_t>::max() ||
+        size > std::numeric_limits<std::size_t>::max() - offset) {
       throw std::invalid_argument("s3rdma: invalid range or destination of a control read");
     }
     if (!if_match.empty() && !is_strong_validator(if_match)) {

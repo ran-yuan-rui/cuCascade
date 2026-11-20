@@ -152,7 +152,7 @@ int64_t get(cucascade_s3rdma_session* session,
             cucascade_s3rdma_request_fn request,
             void* context) noexcept
 {
-  if (session == nullptr || base == nullptr || request == nullptr) {
+  if (session == nullptr || base == nullptr || request == nullptr || context == nullptr) {
     return CUCASCADE_S3RDMA_NO_RESULT;
   }
   auto& call =

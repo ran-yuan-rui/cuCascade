@@ -107,11 +107,15 @@ endpoint_parts parts_of(std::string_view endpoint)
     if (path.back() == '/') { path.remove_suffix(1); }
     out.path.assign(path);
   }
-  // A bracketed IPv6 literal is kept whole; otherwise a trailing ":digits" is
-  // the port.
+  // A trailing ":digits" is the port.  Behind a bracketed IPv6 literal only a
+  // colon that follows the closing bracket starts one: the colons of the
+  // literal stay in the host.
   auto const colon    = authority.rfind(':');
-  bool const has_port = !authority.empty() && authority.front() != '[' &&
-                        colon != std::string_view::npos && colon + 1 < authority.size() &&
+  auto const bracket  = authority.find(']');
+  bool const literal  = !authority.empty() && authority.front() == '[';
+  bool const has_port = !authority.empty() && colon != std::string_view::npos &&
+                        colon + 1 < authority.size() &&
+                        (!literal || (bracket != std::string_view::npos && colon == bracket + 1)) &&
                         std::all_of(authority.begin() + static_cast<std::ptrdiff_t>(colon) + 1,
                                     authority.end(),
                                     [](char c) { return c >= '0' && c <= '9'; });
@@ -600,7 +604,7 @@ class binding_session final : public rdma_data_session {
   {
     if (registered_base == nullptr || size == 0 ||
         size > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()) ||
-        size >= std::numeric_limits<std::size_t>::max() - object_offset) {
+        size > std::numeric_limits<std::size_t>::max() - object_offset) {
       throw std::invalid_argument("s3rdma: invalid range or destination of a data GET");
     }
     if (!if_match.empty() && !is_strong_validator(if_match)) {
