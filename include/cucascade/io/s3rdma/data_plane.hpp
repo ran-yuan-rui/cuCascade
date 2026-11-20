@@ -75,12 +75,14 @@ struct data_plane_config {
 /**
  * @brief Data sessions over the binding library of @p cfg.
  *
- * Loads the library — once per process, never unloaded — checks its interface
- * version and its protocol, and returns a factory whose sessions transfer
- * through it.  Each GET sends exactly one request, signed by @p authorizer
- * with the RDMA token, the range and any condition inside the signature, to
- * the endpoint @p authorizer was built for.  That request follows no
- * redirect, uses no proxy and is never repeated.
+ * Loads the configured library, checks its interface version and its
+ * protocol, and returns a factory whose sessions transfer through it.  An
+ * interface that passes the structural checks is kept by path and not looked
+ * up again; the protocol and retry probe runs for every factory.  A library
+ * that was loaded is never unloaded.  Each GET sends exactly one request,
+ * signed by @p authorizer with the RDMA token, the range and any condition
+ * inside the signature, to the endpoint @p authorizer was built for.  That
+ * request follows no redirect, uses no proxy and is never repeated.
  *
  * @param authorizer Must sign additional headers; a query-signing authorizer
  *                   is refused here.

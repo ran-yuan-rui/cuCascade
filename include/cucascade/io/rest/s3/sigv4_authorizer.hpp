@@ -117,9 +117,9 @@ class sigv4_header_authorizer final : public sigv4_authorizer_base {
                                std::chrono::seconds timeout) override;
 
   /// As @ref authorize, with @p signed_headers inside the signature and in the
-  /// returned headers. A value keeps its meaning only if it survives SigV4
-  /// canonicalization unchanged, so control characters and runs of spaces are
-  /// rejected.
+  /// returned headers. A value with a control character or a run of spaces is
+  /// rejected; a single leading or trailing space is allowed and is trimmed
+  /// for the canonical request.
   /// @throw cucascade::io::credential_error on empty bucket / key, on a header
   ///        name that is empty, malformed, repeated or one of @c host,
   ///        @c x-amz-date, @c x-amz-content-sha256, @c x-amz-security-token and

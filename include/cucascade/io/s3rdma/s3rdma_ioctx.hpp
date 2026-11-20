@@ -113,11 +113,11 @@ class s3rdma_ioctx final : public templated_ioctx<s3rdma_reactor> {
    * @brief Stream the ListObjectsV2 pages of @p bucket under @p prefix to
    * @p sink, one call per page; @p sink returns false to stop.
    *
-   * Listing runs on the control plane: one signed request per page, never
-   * repeated, each under the rules of every other control call — refused
-   * before a successful start and once the backend stopped.  Page size,
-   * continuation and the caps are those of @c rest::object_store_lister, as
-   * for the REST backend.
+   * Listing makes one control-client call per page, with one control permit
+   * and no retry in the lister; the transport policy of the control client
+   * applies.  A call is refused before a successful start and once the
+   * backend has stopped.  Page size, continuation and the caps are those of
+   * @c rest::object_store_lister, as for the REST backend.
    *
    * @throws std::exception a page failed, the listing is malformed or a cap
    *         was exceeded; a listing is never truncated.

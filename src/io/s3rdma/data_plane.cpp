@@ -135,9 +135,11 @@ endpoint_parts parts_of(std::string_view endpoint)
 /**
  * The table of the binding library at @p path, after its handshake and probe.
  *
- * A library is loaded once and never unloaded, also when it is then refused:
+ * A library that was loaded is never unloaded, also when it is then refused:
  * it may have initialized an RDMA client, which does not survive being
- * unloaded.  Nothing but the given path is consulted.
+ * unloaded.  A table that passes the structural checks is kept by path; a
+ * library whose table was refused is opened and asked again by the next
+ * factory.  Nothing but the given path is consulted.
  */
 cucascade_s3rdma_api const& load_binding(std::string const& path, bool require_zero_io_retry)
 {

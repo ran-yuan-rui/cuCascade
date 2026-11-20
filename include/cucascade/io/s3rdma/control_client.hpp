@@ -36,8 +36,8 @@ struct control_client_config {
   /// False disables peer and host verification, for development endpoints.
   bool tls_verify{true};
 
-  /// Bound on one HEAD or LIST request, and the margin added to the lifetime
-  /// of a query-signed URL.  Must be positive.
+  /// Bound on one HEAD or LIST request.  A query-signed URL lives for this
+  /// bound plus 60 seconds.  Must be positive.
   std::chrono::seconds request_timeout{30};
 
   /// A range GET has no bound on its duration: it fails when it stays below
