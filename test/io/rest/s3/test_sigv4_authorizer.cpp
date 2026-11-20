@@ -777,3 +777,145 @@ TEST_CASE("mock_authorizer can force credential errors", "[s3][authorizer]")
   CHECK(request.url == "https://signed.example/object");
   CHECK(request.headers.empty());
 }
+
+#include "io/s3rdma/sigv4_reference.hpp"
+
+TEST_CASE("SigV4 additional headers match an independent canonical signature", "[s3][authorizer]")
+{
+  auto credentials          = example_static_credentials();
+  credentials.session_token = "session-fixture";
+  sigv4_header_authorizer provider(credentials, "us-east-1", "https://store.example");
+  std::vector<std::pair<std::string, std::string>> extra{{"x-amz-rdma-token", "CAPABILITY-FIXTURE"},
+                                                         {"Range", "bytes=17-20"},
+                                                         {"If-Match", "\"opened-version\""}};
+  auto const request = provider.authorize_with_headers(
+    {"bucket", "nested/key"}, request_method::GET, extra, k_presign_timeout);
+  auto const names =
+    "host;if-match;range;x-amz-content-sha256;x-amz-date;x-amz-rdma-token;x-amz-security-token";
+  auto const authorization = header_value(request.headers, "authorization");
+  CHECK(request.url == "https://store.example/bucket/nested/key");
+  CHECK(contains(authorization, std::string{"SignedHeaders="} + names + ","));
+  for (auto const& [name, value] : extra) {
+    CHECK(header_value(request.headers, name) == value);
+  }
+  auto const signature = cucascade::test::s3rdma::reference_sigv4(
+    request.headers, "GET", "/bucket/nested/key", names, credentials.secret_access_key);
+  CHECK(authorization.substr(authorization.find("Signature=") + 10) == signature);
+
+  auto const valid_name = provider.authorize_with_headers(
+    {"bucket", "key"}, request_method::GET, {{"X-Trace_2", "one space"}}, k_presign_timeout);
+  CHECK(header_value(valid_name.headers, "x-trace_2") == "one space");
+}
+
+TEST_CASE("SigV4 malformed names are identified without disclosing values", "[s3][authorizer]")
+{
+  sigv4_header_authorizer provider(
+    example_static_credentials(), "us-east-1", "https://store.example");
+  for (std::string const name : {"", "bad.name", "bad name", "bad:name", "bad/name", "bad@name"}) {
+    CAPTURE(name);
+    std::string message;
+    try {
+      (void)provider.authorize_with_headers(
+        {"bucket", "key"}, request_method::GET, {{name, "VALUE-NOT-FOR-LOGS"}}, k_presign_timeout);
+    } catch (credential_error const& error) {
+      message = error.what();
+    }
+    REQUIRE_FALSE(message.empty());
+    CHECK(contains(message, "header"));
+    if (!name.empty()) { CHECK(contains(message, name)); }
+    CHECK_FALSE(contains(message, "VALUE-NOT-FOR-LOGS"));
+  }
+}
+
+TEST_CASE("SigV4 refuses reserved and repeated names case insensitively", "[s3][authorizer]")
+{
+  sigv4_header_authorizer provider(
+    example_static_credentials(), "us-east-1", "https://store.example");
+  auto check = [&](std::vector<std::pair<std::string, std::string>> const& headers,
+                   std::string_view named) {
+    std::string message;
+    try {
+      (void)provider.authorize_with_headers(
+        {"bucket", "key"}, request_method::GET, headers, k_presign_timeout);
+    } catch (credential_error const& error) {
+      message = error.what();
+    }
+    REQUIRE_FALSE(message.empty());
+    CHECK(contains(message, named));
+    CHECK_FALSE(contains(message, "VALUE-NOT-FOR-LOGS"));
+  };
+  for (std::string const name :
+       {"host", "x-amz-date", "x-amz-content-sha256", "x-amz-security-token", "authorization"}) {
+    CAPTURE(name);
+    check({{name, "VALUE-NOT-FOR-LOGS"}}, name);
+    auto upper = name;
+    std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) {
+      return static_cast<char>(std::toupper(c));
+    });
+    check({{upper, "VALUE-NOT-FOR-LOGS"}}, name);
+  }
+  check({{"Range", "VALUE-NOT-FOR-LOGS"}, {"range", "another"}}, "range");
+}
+
+TEST_CASE("SigV4 refuses every control byte and repeated space without disclosing values",
+          "[s3][authorizer]")
+{
+  sigv4_header_authorizer provider(
+    example_static_credentials(), "us-east-1", "https://store.example");
+  std::vector<std::string> values;
+  for (unsigned byte = 0; byte < 32; ++byte) {
+    values.push_back("VALUE-NOT-FOR-LOGS" + std::string(1, static_cast<char>(byte)));
+  }
+  values.push_back("VALUE-NOT-FOR-LOGS" + std::string(1, '\x7f'));
+  values.push_back("VALUE-NOT-FOR-LOGS  trailing");
+  values.push_back("  VALUE-NOT-FOR-LOGS");
+  values.push_back("VALUE-NOT-FOR-LOGS  ");
+  for (auto const& value : values) {
+    std::string message;
+    try {
+      (void)provider.authorize_with_headers(
+        {"bucket", "key"}, request_method::GET, {{"x-amz-rdma-token", value}}, k_presign_timeout);
+    } catch (credential_error const& error) {
+      message = error.what();
+    }
+    REQUIRE_FALSE(message.empty());
+    CHECK(contains(message, "x-amz-rdma-token"));
+    CHECK_FALSE(contains(message, "VALUE-NOT-FOR-LOGS"));
+  }
+}
+
+TEST_CASE("Authorizers preserve ordinary authorization and refuse unsupported header signing",
+          "[s3][authorizer]")
+{
+  auto const credentials = example_static_credentials();
+  sigv4_header_authorizer header(credentials, "us-east-1", "https://store.example");
+  object_ref object{"bucket", "key"};
+  auto const plain = header.authorize(object, request_method::GET, k_presign_timeout);
+  auto const empty =
+    header.authorize_with_headers(object, request_method::GET, {}, k_presign_timeout);
+  auto const names = "host;x-amz-content-sha256;x-amz-date";
+  CHECK(plain.url == empty.url);
+  for (auto const& request : {plain, empty}) {
+    auto const authorization = header_value(request.headers, "authorization");
+    CHECK(contains(authorization, std::string{"SignedHeaders="} + names + ","));
+    CHECK(header_value(request.headers, "range").empty());
+    CHECK(header_value(request.headers, "if-match").empty());
+    CHECK(header_value(request.headers, "x-amz-rdma-token").empty());
+    CHECK(authorization.substr(authorization.find("Signature=") + 10) ==
+          cucascade::test::s3rdma::reference_sigv4(
+            request.headers, "GET", "/bucket/key", names, credentials.secret_access_key));
+  }
+  object_only_authorizer default_provider;
+  CHECK(default_provider.authorize_with_headers(object, request_method::GET, {}, k_presign_timeout)
+          .url == "https://example.invalid/object");
+  CHECK_THROWS_AS(default_provider.authorize_with_headers(
+                    object, request_method::GET, {{"range", "bytes=0-3"}}, k_presign_timeout),
+                  credential_error);
+  sigv4_presigned_authorizer presigned(credentials, "us-east-1", "https://store.example");
+  CHECK(contains(
+    presigned.authorize_with_headers(object, request_method::GET, {}, k_presign_timeout).url,
+    "X-Amz-Signature="));
+  CHECK_THROWS_AS(presigned.authorize_with_headers(
+                    object, request_method::GET, {{"range", "bytes=0-3"}}, k_presign_timeout),
+                  credential_error);
+}

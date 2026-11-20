@@ -185,9 +185,8 @@ if(CUCASCADE_BUILD_S3_RDMA)
                         ${CMAKE_CURRENT_SOURCE_DIR}/utils)
   endforeach()
 
-  # Sources of the GPU-free suite that are added when they exist: the HTTP
-  # fixture and the suites of the control client, the data plane, conditional
-  # reads and listing.
+  # Sources of the GPU-free suite that are added when they exist. The GPU suite
+  # reads through the ioctx against the same HTTP fixture.
   foreach(
     source
     io/s3rdma/http_fixture.cpp io/s3rdma/test_s3rdma_control_client.cpp
@@ -197,17 +196,23 @@ if(CUCASCADE_BUILD_S3_RDMA)
       target_sources(cucascade_s3rdma_tests PRIVATE ${source})
     endif()
   endforeach()
+  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/io/s3rdma/http_fixture.cpp)
+    target_sources(cucascade_s3rdma_gpu_tests
+                   PRIVATE io/s3rdma/http_fixture.cpp)
+  endif()
 
-  # Bindings for the data-plane suite: one module per line of
+  # Bindings for both suites: one module per line of
   # io/s3rdma/test_binding_variants.txt, each built from
   # io/s3rdma/test_binding.cpp with S3RDMA_TEST_BINDING_VARIANT_<line> defined.
-  # A module sees only the binding interface header; the suite loads it by path,
+  # A module sees only the binding interface header; a suite loads it by path,
   # and none is installed.
   set(CUCASCADE_S3RDMA_TEST_BINDING_DIR
       ${CMAKE_CURRENT_BINARY_DIR}/s3rdma_bindings)
-  target_compile_definitions(
-    cucascade_s3rdma_tests
-    PRIVATE S3RDMA_TEST_BINDING_DIR="${CUCASCADE_S3RDMA_TEST_BINDING_DIR}")
+  foreach(target cucascade_s3rdma_tests cucascade_s3rdma_gpu_tests)
+    target_compile_definitions(
+      ${target}
+      PRIVATE S3RDMA_TEST_BINDING_DIR="${CUCASCADE_S3RDMA_TEST_BINDING_DIR}")
+  endforeach()
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/io/s3rdma/test_binding.cpp
      AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/io/s3rdma/test_binding_variants.txt)
     file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/io/s3rdma/test_binding_variants.txt
@@ -225,6 +230,7 @@ if(CUCASCADE_BUILD_S3_RDMA)
         ${binding} PROPERTIES PREFIX "" LIBRARY_OUTPUT_DIRECTORY
                                         ${CUCASCADE_S3RDMA_TEST_BINDING_DIR})
       add_dependencies(cucascade_s3rdma_tests ${binding})
+      add_dependencies(cucascade_s3rdma_gpu_tests ${binding})
     endforeach()
   endif()
 
