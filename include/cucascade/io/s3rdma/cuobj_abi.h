@@ -105,6 +105,8 @@ typedef struct cucascade_s3rdma_api {
    * context and returns the client's result unchanged, or
    * CUCASCADE_S3RDMA_NO_RESULT when there is none.  The client may run
    * request on another thread, more than once, and after get returned.
+   * context is a value, not an address: it is handed to request unchanged
+   * and never dereferenced, and it is not NULL.
    */
   int64_t (*get)(cucascade_s3rdma_session* session,
                  void* base,

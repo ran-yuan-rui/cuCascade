@@ -424,6 +424,9 @@ class curl_control_client final : public s3_control_client {
       CUCASCADE_CURL_CHECK(curl_easy_setopt(
         handle, CURLOPT_LOW_SPEED_TIME, static_cast<long>(_cfg.stall_time.count())));
     }
+    // The path is sent as it was authorized: "." and ".." are legal in an
+    // object key, and the transport would otherwise remove such segments.
+    CUCASCADE_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_PATH_AS_IS, 1L));
     CUCASCADE_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_URL, url.c_str()));
     CUCASCADE_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_HTTPHEADER, headers));
   }

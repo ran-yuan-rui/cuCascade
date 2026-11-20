@@ -26,13 +26,13 @@
 #include <dlfcn.h>
 
 #include <algorithm>
-#include <array>
 #include <cctype>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
@@ -40,6 +40,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -308,14 +309,14 @@ struct data_plane {
   cucascade_s3rdma_api const* api{nullptr};
 };
 
-struct get_state;
+/// A callback identity is carried where the client keeps a pointer.
+static_assert(sizeof(void*) == sizeof(std::uint64_t));
 
-/// What the client hands back to the request callback: which GET of which
-/// session the callback belongs to.
-struct get_ticket {
-  get_state* state{nullptr};
-  std::uint64_t generation{0};  ///< guarded by the state's gate
-};
+/// How many bits of a callback identity number the GETs of one session; the
+/// remaining ones number the sessions of the process.
+constexpr unsigned sequence_bits      = 40;
+constexpr std::uint64_t sequence_mask = (std::uint64_t{1} << sequence_bits) - 1;
+constexpr std::uint64_t last_serial   = (std::uint64_t{1} << (64 - sequence_bits)) - 1;
 
 /**
  * One GET as its request callback sees it, and what that callback observed.
@@ -323,28 +324,32 @@ struct get_ticket {
  * The client may run the callback more than once for one GET — a retry, a
  * continuation — or with another shape than asked.  Only the first run, with
  * offset zero and the whole length, sends a request; every other run is
- * refused without sending anything.  A run that carries the ticket of an
- * earlier GET is refused the same way and fails the GET in progress.
+ * refused without sending anything.
+ *
+ * What the client hands back to a callback is a number, not an address: the
+ * serial of the session and the sequence of the GET within it.  Neither is
+ * used twice.  A callback of a GET that has ended can therefore never be
+ * taken for a later GET, however late it runs: it is refused, sends nothing,
+ * touches nothing the ended GET borrowed from its caller, and fails the GET
+ * that is in progress or comes next.  A callback of a session that is gone
+ * finds no session.
  *
  * The gate is held for a whole callback and while a GET starts and ends.  A
- * GET therefore does not end while its request is on the way, and a callback
- * that starts after the end belongs to no GET: it sends nothing and does not
- * touch what the finished GET borrowed from its caller.
+ * GET therefore does not end while its request is on the way.
  *
  * Nothing here is logged and no message carries a header value: the token is
  * a capability.
  */
 struct get_state {
-  get_state() noexcept
-  {
-    for (auto& ticket : tickets) {
-      ticket.state = this;
-    }
-  }
+  get_state()                            = default;
   get_state(get_state const&)            = delete;
   get_state& operator=(get_state const&) = delete;
 
   std::mutex gate;
+
+  std::uint64_t serial{0};    ///< of the session; set once, before its first GET
+  std::uint64_t sequence{0};  ///< of the GET in progress; zero between GETs
+  std::uint64_t issued{0};    ///< sequences handed out
 
   data_plane const* plane{nullptr};
   CURL* handle{nullptr};
@@ -353,13 +358,8 @@ struct get_state {
   std::size_t size{0};
   std::string_view condition;  ///< the caller's; valid until the GET ends
 
-  std::uint64_t generation{0};  ///< changes when a GET starts and when it ends
-  std::uint64_t issued{0};      ///< tickets handed out
-  std::uint32_t runs{0};        ///< callbacks run for the GET in progress
-  std::uint32_t stale{0};       ///< callbacks run for a GET that has ended
-  // A ticket is used again only several GETs later, so the one an earlier GET
-  // handed out still names that GET while the next ones run.
-  std::array<get_ticket, 8> tickets;
+  std::uint32_t runs{0};    ///< callbacks run for the GET in progress
+  std::uint32_t stale{0};   ///< callbacks run, since a GET last ended, for a GET that had ended
   bool handed_over{false};  ///< the request was given to the transport
   bool answered{false};     ///< a whole response arrived
   long status{0};
@@ -368,43 +368,99 @@ struct get_state {
   std::size_t delivered{0};
   std::string failure;  ///< a local or transport failure; empty otherwise
 
-  [[nodiscard]] get_ticket* begin(data_plane const& owner,
-                                  CURL* easy,
-                                  object_ref const& target,
-                                  std::size_t offset,
-                                  std::size_t length,
-                                  std::string_view if_match)
+  /// Starts a GET.  Returns what the client hands back to its callbacks, or
+  /// zero when the session has used every sequence.
+  [[nodiscard]] std::uint64_t begin(data_plane const& owner,
+                                    CURL* easy,
+                                    object_ref const& target,
+                                    std::size_t offset,
+                                    std::size_t length,
+                                    std::string_view if_match)
   {
     std::lock_guard lock{gate};
-    auto& ticket      = tickets[issued++ % tickets.size()];
-    ticket.generation = ++generation;
-    plane             = &owner;
-    handle            = easy;
-    object            = &target;
-    object_offset     = offset;
-    size              = length;
-    condition         = if_match;
-    runs              = 0;
-    handed_over       = false;
-    answered          = false;
-    status            = 0;
+    if (issued == sequence_mask) { return 0; }
+    sequence      = ++issued;
+    plane         = &owner;
+    handle        = easy;
+    object        = &target;
+    object_offset = offset;
+    size          = length;
+    condition     = if_match;
+    runs          = 0;
+    handed_over   = false;
+    answered      = false;
+    status        = 0;
     reply.clear();
     etag.clear();
     delivered = 0;
     failure.clear();
-    return &ticket;
+    return (serial << sequence_bits) | sequence;
   }
 
   /// Ends the GET in progress.  Returns the callbacks run for it plus those
-  /// run, since the last GET ended, for a GET that had already ended: the
-  /// client did something this backend does not account for.
+  /// run, since a GET last ended, for a GET that had already ended: the
+  /// client did something this backend does not account for, and the GET is
+  /// reported as failed.
   [[nodiscard]] std::uint32_t end()
   {
     std::lock_guard lock{gate};
-    ++generation;
-    return runs + std::exchange(stale, 0U);
+    sequence         = 0;
+    auto const total = std::uint64_t{runs} + std::exchange(stale, 0U);
+    if (total != runs && failure.empty()) {
+      failure = "the client ran a request callback of a GET that had ended";
+    }
+    return static_cast<std::uint32_t>(
+      std::min<std::uint64_t>(total, std::numeric_limits<std::uint32_t>::max()));
   }
 };
+
+/**
+ * The data sessions of the process by serial.  A callback finds its session
+ * here and nowhere else, so one that runs after the session is gone finds
+ * nothing.  Never destroyed: the client may run a callback while the process
+ * exits.
+ */
+class session_registry {
+ public:
+  /// Registers @p state under a serial of its own; false when the process has
+  /// used every serial.
+  [[nodiscard]] bool enter(std::shared_ptr<get_state> const& state)
+  {
+    std::lock_guard lock{_mutex};
+    if (_issued == last_serial) { return false; }
+    state->serial = ++_issued;
+    _sessions.emplace(state->serial, state);
+    return true;
+  }
+
+  void leave(std::uint64_t serial) noexcept
+  {
+    try {
+      std::lock_guard lock{_mutex};
+      _sessions.erase(serial);
+    } catch (...) {
+      // The state stays registered and takes no further GET.
+    }
+  }
+
+  [[nodiscard]] std::shared_ptr<get_state> find(std::uint64_t serial)
+  {
+    std::lock_guard lock{_mutex};
+    auto const found = _sessions.find(serial);
+    return found == _sessions.end() ? nullptr : found->second;
+  }
+
+ private:
+  std::mutex _mutex;
+  std::uint64_t _issued{0};
+  std::unordered_map<std::uint64_t, std::shared_ptr<get_state>> _sessions;
+};
+
+session_registry& sessions()
+{
+  static auto* const registry = new session_registry;
+  return *registry;
+}
 
 /// Send the one request of @p state and judge its response.  The byte count
 /// on success; @c refused otherwise, with @p state saying why.
@@ -463,6 +519,9 @@ std::int64_t send_request(get_state& state, cucascade_s3rdma_request const& requ
   CUCASCADE_CURL_CHECK(curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 0L));
   CUCASCADE_CURL_CHECK(curl_easy_setopt(easy, CURLOPT_PROXY, ""));
   CUCASCADE_CURL_CHECK(curl_easy_setopt(easy, CURLOPT_NOPROXY, "*"));
+  // The path is sent as it was signed: "." and ".." are legal in an object
+  // key, and the transport would otherwise remove such segments.
+  CUCASCADE_CURL_CHECK(curl_easy_setopt(easy, CURLOPT_PATH_AS_IS, 1L));
   CUCASCADE_CURL_CHECK(curl_easy_setopt(
     easy, CURLOPT_TIMEOUT_MS, static_cast<long>(plane.cfg.request_deadline.count())));
   if (!plane.cfg.ca_bundle_path.empty()) {
@@ -518,16 +577,18 @@ std::int64_t send_request(get_state& state, cucascade_s3rdma_request const& requ
 /// the client's frames.
 std::int64_t on_request(void* context, cucascade_s3rdma_request const* request) noexcept
 {
-  auto* const ticket = static_cast<get_ticket*>(context);
-  if (ticket == nullptr || ticket->state == nullptr) { return refused; }
-  auto& state = *ticket->state;
   try {
+    auto const identity = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(context));
+    auto const found    = sessions().find(identity >> sequence_bits);
+    if (found == nullptr) { return refused; }
+    auto& state = *found;
     std::lock_guard lock{state.gate};
-    if (ticket->generation != state.generation) {
-      ++state.stale;
+    if (state.sequence == 0 || (identity & sequence_mask) != state.sequence) {
+      if (state.stale != std::numeric_limits<std::uint32_t>::max()) { ++state.stale; }
       return refused;
     }
-    if (state.runs++ != 0) { return refused; }
+    if (state.runs != std::numeric_limits<std::uint32_t>::max()) { ++state.runs; }
+    if (state.runs != 1) { return refused; }
     try {
       if (request == nullptr) {
         state.failure = "the client ran the request callback without a request";
@@ -543,7 +604,8 @@ std::int64_t on_request(void* context, cucascade_s3rdma_request const* request) 
       return refused;
     }
   } catch (...) {
-    // The gate could not be taken: nothing was sent.
+    // The session could not be looked up or its gate not taken: nothing was
+    // sent.
     return refused;
   }
 }
@@ -558,13 +620,21 @@ class binding_session final : public rdma_data_session {
     : _plane(std::move(plane)), _easy(curl_easy_init())
   {
     if (_easy == nullptr) { throw unavailable("s3rdma: curl_easy_init failed"); }
+    if (!sessions().enter(_state)) {
+      throw unavailable("s3rdma: the process has used every data-session serial");
+    }
     if (_plane->api->session_create(&_session) != 0 || _session == nullptr) {
       _session = nullptr;
+      sessions().leave(_state->serial);
       throw unavailable("s3rdma: the binding library could not create a data session");
     }
   }
 
-  ~binding_session() override { _plane->api->session_destroy(_session); }
+  ~binding_session() override
+  {
+    _plane->api->session_destroy(_session);
+    sessions().leave(_state->serial);
+  }
 
   binding_session(binding_session const&)            = delete;
   binding_session& operator=(binding_session const&) = delete;
@@ -610,22 +680,33 @@ class binding_session final : public rdma_data_session {
     if (!if_match.empty() && !is_strong_validator(if_match)) {
       throw std::invalid_argument("s3rdma: a GET can be conditioned on a strong validator only");
     }
-    auto* const ticket = _state.begin(*_plane, _easy.get(), object, object_offset, size, if_match);
+    auto const identity =
+      _state->begin(*_plane, _easy.get(), object, object_offset, size, if_match);
+    if (identity == 0) {
+      data_get_result unissued;
+      unissued.transport_error = "the session has used every GET sequence";
+      return unissued;
+    }
     auto const returned =
-      _plane->api->get(_session, registered_base, size, dest_offset, &on_request, ticket);
-    auto const invocations = _state.end();
+      _plane->api->get(_session,
+                       registered_base,
+                       size,
+                       dest_offset,
+                       &on_request,
+                       reinterpret_cast<void*>(static_cast<std::uintptr_t>(identity)));
+    auto const invocations = _state->end();
 
     data_get_result result;
     result.sdk_return           = returned;
     result.callback_invocations = invocations;
-    result.commit               = !_state.handed_over ? data_commit_state::not_sent
-                                  : _state.answered   ? data_commit_state::completed
-                                                      : data_commit_state::sent_unknown;
-    result.delivered_bytes      = _state.delivered;
-    result.http_status          = _state.status;
-    result.reply_tag            = std::move(_state.reply);
-    result.validation_tag       = std::move(_state.etag);
-    result.transport_error      = std::move(_state.failure);
+    result.commit               = !_state->handed_over ? data_commit_state::not_sent
+                                  : _state->answered   ? data_commit_state::completed
+                                                       : data_commit_state::sent_unknown;
+    result.delivered_bytes      = _state->delivered;
+    result.http_status          = _state->status;
+    result.reply_tag            = std::move(_state->reply);
+    result.validation_tag       = std::move(_state->etag);
+    result.transport_error      = std::move(_state->failure);
     return result;
   }
 
@@ -633,9 +714,9 @@ class binding_session final : public rdma_data_session {
   std::shared_ptr<data_plane const> _plane;
   curl_easy_ptr _easy;
   cucascade_s3rdma_session* _session{nullptr};
-  // Owned by the session, not by one GET: a callback the client runs after
-  // its GET returned finds live memory.
-  get_state _state;
+  // Shared with the registry of sessions: a callback that is running when
+  // the session goes away keeps it alive.
+  std::shared_ptr<get_state> _state{std::make_shared<get_state>()};
 };
 
 class binding_session_factory final : public rdma_data_session_factory {

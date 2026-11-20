@@ -25,36 +25,91 @@
 #include <cuobjclient.h>
 #include <sys/types.h>
 
-#include <array>
-#include <atomic>
 #include <cerrno>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
-
-namespace {
-
-// The request callback of one GET and the context it runs with.
-struct get_call {
-  std::atomic<cucascade_s3rdma_request_fn> request{nullptr};
-  std::atomic<void*> context{nullptr};
-};
-
-}  // namespace
+#include <type_traits>
 
 struct cucascade_s3rdma_session {
   // Handed to the client by reference, so it lives as long as the client.
   CUObjOps_t ops{};
   cuObjClient* client{nullptr};
-  // Each GET hands the client a call of its own, so a callback the client runs
-  // late still arrives with the context of the GET it belongs to.  Kept in the
-  // session rather than in the frame of get, and used again only several GETs
-  // later.
-  std::array<get_call, 8> calls{};
-  std::atomic<std::uint64_t> issued{0};
 };
 
 namespace {
+
+// The number of a GET is carried where the client keeps a pointer.
+static_assert(sizeof(void*) == sizeof(std::uint64_t));
+
+// One GET in progress: its number, its request callback and the context that
+// callback runs with.  It lives in the frame of get.
+struct get_call {
+  std::uint64_t number{0};
+  cucascade_s3rdma_request_fn request{nullptr};
+  void* context{nullptr};
+  get_call* next{nullptr};
+};
+
+// The GETs in progress, each under a number that is never used twice.  The
+// client is handed that number, not an address, so a callback it runs after
+// its GET returned finds nothing here and can never be taken for a later GET.
+// It allocates nothing and needs neither construction nor destruction: the
+// client may run a callback while the process starts or exits.
+class call_registry {
+ public:
+  constexpr call_registry() = default;
+
+  // False when every number has been used.
+  [[nodiscard]] bool enter(get_call& call)
+  {
+    std::lock_guard lock{_mutex};
+    if (_issued == std::numeric_limits<std::uint64_t>::max()) { return false; }
+    call.number = ++_issued;
+    call.next   = _first;
+    _first      = &call;
+    return true;
+  }
+
+  // An entry that cannot be removed would outlive its frame, so a failure to
+  // take the lock ends the process.
+  void leave(get_call& call) noexcept
+  {
+    std::lock_guard lock{_mutex};
+    for (auto** link = &_first; *link != nullptr; link = &(*link)->next) {
+      if (*link == &call) {
+        *link = call.next;
+        return;
+      }
+    }
+  }
+
+  [[nodiscard]] bool find(std::uint64_t number,
+                          cucascade_s3rdma_request_fn& request,
+                          void*& context)
+  {
+    std::lock_guard lock{_mutex};
+    for (auto const* call = _first; call != nullptr; call = call->next) {
+      if (call->number == number) {
+        request = call->request;
+        context = call->context;
+        return true;
+      }
+    }
+    return false;
+  }
+
+ private:
+  std::mutex _mutex;
+  std::uint64_t _issued{0};
+  get_call* _first{nullptr};
+};
+
+static_assert(std::is_trivially_destructible_v<call_registry>);
+
+constinit call_registry calls;
 
 // Nothing may leave a callback through the client's frames.
 ssize_t on_get(const void* handle,
@@ -63,16 +118,24 @@ ssize_t on_get(const void* handle,
                loff_t offset,
                const cufileRDMAInfo_t* rdma) noexcept
 {
-  auto* const call = static_cast<get_call*>(cuObjClient::getCtx(handle));
-  if (call == nullptr) { return -ENOTSUP; }
-  auto const request = call->request.load(std::memory_order_acquire);
-  if (request == nullptr) { return -ENOTSUP; }
+  cucascade_s3rdma_request_fn request = nullptr;
+  void* context                       = nullptr;
+  try {
+    auto const number =
+      static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(cuObjClient::getCtx(handle)));
+    if (!calls.find(number, request, context)) { return -ENOTSUP; }
+  } catch (...) {
+    return -ENOTSUP;
+  }
+  // The client states the length as a signed value; a negative one describes
+  // no descriptor.
+  if (rdma != nullptr && rdma->desc_len < 0) { return -ENOTSUP; }
   cucascade_s3rdma_request what{};
   what.descriptor        = rdma != nullptr ? rdma->desc_str : nullptr;
   what.descriptor_length = rdma != nullptr ? static_cast<size_t>(rdma->desc_len) : 0;
   what.size              = size;
   what.offset            = static_cast<int64_t>(offset);
-  return static_cast<ssize_t>(request(call->context.load(std::memory_order_acquire), &what));
+  return static_cast<ssize_t>(request(context, &what));
 }
 
 int32_t probe(cucascade_s3rdma_probe* out) noexcept
@@ -155,15 +218,27 @@ int64_t get(cucascade_s3rdma_session* session,
   if (session == nullptr || base == nullptr || request == nullptr || context == nullptr) {
     return CUCASCADE_S3RDMA_NO_RESULT;
   }
-  auto& call =
-    session->calls[session->issued.fetch_add(1, std::memory_order_acq_rel) % session->calls.size()];
-  call.context.store(context, std::memory_order_release);
-  call.request.store(request, std::memory_order_release);
+  get_call call;
+  call.request = request;
+  call.context = context;
+  try {
+    if (!calls.enter(call)) { return CUCASCADE_S3RDMA_NO_RESULT; }
+  } catch (...) {
+    return CUCASCADE_S3RDMA_NO_RESULT;
+  }
+  struct leave_at_return {
+    get_call& call;
+    ~leave_at_return() { calls.leave(call); }
+  } const leaving{call};
   try {
     // The registered base with the destination as buf_offset: an interior
     // pointer would not name the registration.
     return static_cast<int64_t>(
-      session->client->cuObjGet(&call, base, length, 0, static_cast<loff_t>(destination_offset)));
+      session->client->cuObjGet(reinterpret_cast<void*>(static_cast<std::uintptr_t>(call.number)),
+                                base,
+                                length,
+                                0,
+                                static_cast<loff_t>(destination_offset)));
   } catch (...) {
     return CUCASCADE_S3RDMA_NO_RESULT;
   }
